@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
@@ -10,6 +11,7 @@ import '../models/library_item.dart';
 import '../models/saga.dart';
 import '../services/import_service.dart';
 import '../services/library_store.dart';
+import '../services/vault_android_permissions.dart';
 import '../utils/comic_name_parser.dart';
 import 'comic_reader_screen.dart';
 import 'pdf_reading_mode_screen.dart';
@@ -412,12 +414,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
           onPagePersist: (p, {int? totalPages}) {
             final i = _items.indexWhere((e) => e.id == item.id);
             if (i < 0) return;
-            setState(() {
-              _items[i].lastPageIndex = p;
-              _items[i].lastReadAt = DateTime.now();
-              if (totalPages != null) _items[i].totalPages = totalPages;
-            });
+            _items[i].lastPageIndex = p;
+            _items[i].lastReadAt = DateTime.now();
+            if (totalPages != null) _items[i].totalPages = totalPages;
             _persist();
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) setState(() {});
+            });
           },
         ),
       ),
@@ -521,6 +524,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
             surfaceTintColor: Colors.transparent,
             title: const Text('As tuas sagas'),
             actions: [
+              if (!kIsWeb && Platform.isAndroid)
+                IconButton(
+                  onPressed: () {
+                    unawaited(
+                      vaultMaybeRequestAndroidBackgroundPermissions(
+                        context,
+                        skipExplanation: true,
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.phonelink_setup_rounded),
+                  tooltip: 'Permissões para leitura em segundo plano',
+                ),
               IconButton(
                 onPressed: _addFiles,
                 icon: const Icon(Icons.file_open_outlined),

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show File;
 import 'dart:math' show max, min;
 
 import 'package:flutter/foundation.dart'
@@ -9,10 +10,12 @@ import 'package:flutter/rendering.dart' show RenderParagraph;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_theme.dart';
 import '../models/library_item.dart';
 import '../services/tts_service.dart';
+import '../services/vault_reading_audio.dart';
 
 const _kVoicePrefsKey = 'read_aloud_voice_json';
 const _kReadAloudEngine = 'read_aloud_engine';
@@ -50,7 +53,8 @@ bool _isLocalePtBr(String? raw) {
   return n == 'pt-br' || n.startsWith('pt-br');
 }
 
-class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
+class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
+    with WidgetsBindingObserver {
   final FlutterTts _tts = FlutterTts();
   PdfDocument? _doc;
   int _currentPage = 1;
@@ -68,6 +72,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
   final ScrollController _scrollController = ScrollController();
   final _textKey = GlobalKey();
 
+  StreamSubscription<void>? _vaultAudioStopSub;
+
   var _playbackVolume = 1.0;
   var _pendingBackChunk = false;
   int? _pendingJumpChunk;
@@ -82,8 +88,20 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _vaultAudioStopSub = VaultReadingAudio.systemStopRequests.listen((_) {
+      if (!mounted) return;
+      _stopPlayback();
+    });
     unawaited(_bootstrapTts());
     unawaited(_loadDocument());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.detached) {
+      _stopPlayback();
+    }
   }
 
   Future<void> _bootstrapTts() async {
@@ -95,10 +113,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
     }
     final sv =
         (p.getString(_kSherpaOfflineVoice) ?? 'miro').toLowerCase().trim();
-    if (sv == 'faber') {
-      _sherpaOfflineVoice = 'miro';
-      await p.setString(_kSherpaOfflineVoice, 'miro');
-    } else if (const {'miro', 'dii'}.contains(sv)) {
+    if (const {'miro', 'dii', 'faber'}.contains(sv)) {
       _sherpaOfflineVoice = sv;
     }
     _playbackVolume = (p.getDouble(_kReadAloudVolume) ?? 1.0).clamp(0.0, 1.0);
@@ -114,6 +129,25 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
   Future<void> _persistPlaybackVolume() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_kReadAloudVolume, _playbackVolume);
+  }
+
+  String _mediaChunkTitle(String text, int page) {
+    final t = text.trim();
+    const pfx = 'Pág. ';
+    const maxLen = 52;
+    final head = '$pfx$page · ';
+    if (t.isEmpty) return '${head}Leitura';
+    final budget = maxLen - head.length;
+    if (t.length <= budget) return '$head$t';
+    return '$head${t.substring(0, budget - 1)}…';
+  }
+
+  Uri? _coverArtUri() {
+    final path = widget.item.coverPath;
+    if (path == null || path.isEmpty) return null;
+    final f = File(path);
+    if (!f.existsSync()) return null;
+    return Uri.file(f.path);
   }
 
   void _interruptChunkPlayback() {
@@ -137,7 +171,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
 
   Future<void> selectSherpaVoice(String id) async {
     final normalized = id.toLowerCase().trim();
-    if (!const {'miro', 'dii'}.contains(normalized)) return;
+    if (!const {'miro', 'dii', 'faber'}.contains(normalized)) return;
 
     final wasPlaying = _isPlaying;
     if (wasPlaying) _stopPlayback();
@@ -324,18 +358,21 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
         _pagePlain = '';
         _clearHighlight();
       } else {
-        _pageText = t;
-        _pagePlain = t;
+        final display = _normalizeTtsText(t);
+        _pageText = display;
+        _pagePlain = display;
         _clearHighlight();
       }
     });
   }
 
-  /// Divide texto em segmentos respeitando fronteiras de frase.
-  /// [maxLen] menor (ex. 400) para Sherpa → geração mais rápida + highlight fluido.
+  /// Divide texto em segmentos até [maxLen], cortando preferencialmente em frases.
+  /// Com [splitAtParagraphs]: também corta em `\n\n` / `\n` (bom para motor do sistema).
+  /// Com false (Sherpa offline): ignora parágrafos — leitura contínua com o mínimo de WAVs.
   static List<({String text, int start})> _splitTtsWithOffsets(
     String t, {
     int maxLen = 3000,
+    bool splitAtParagraphs = true,
   }) {
     if (t.isEmpty) return [];
     if (t.length <= maxLen) return [(text: t, start: 0)];
@@ -344,11 +381,21 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
     while (i < t.length) {
       var end = (i + maxLen) > t.length ? t.length : (i + maxLen);
       if (end < t.length) {
-        var cut = t.lastIndexOf('\n\n', end);
+        var cut = -1;
+        if (splitAtParagraphs) {
+          cut = t.lastIndexOf('\n\n', end);
+          if (cut <= i) {
+            cut = t.lastIndexOf('\n', end);
+          }
+        }
         if (cut <= i) cut = t.lastIndexOf('. ', end);
         if (cut <= i) cut = t.lastIndexOf('! ', end);
         if (cut <= i) cut = t.lastIndexOf('? ', end);
-        if (cut <= i) cut = t.lastIndexOf('\n', end);
+        if (cut <= i) cut = t.lastIndexOf('; ', end);
+        if (!splitAtParagraphs && cut <= i) {
+          cut = t.lastIndexOf(', ', end);
+        }
+        if (cut <= i) cut = t.lastIndexOf(' ', end);
         if (cut > i) end = cut + 1;
       }
       final segment = t.substring(i, end);
@@ -360,17 +407,32 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
     return out;
   }
 
+  /// Collapses excessive whitespace so TTS doesn't insert long silences
+  /// between paragraphs. Preserves the original length for offset mapping.
+  static String _normalizeTtsText(String t) {
+    return t
+        .replaceAll(RegExp(r'\r\n'), '\n')
+        .replaceAll(RegExp(r'\n{2,}'), '\n')
+        .replaceAll(RegExp(r'[ \t]{2,}'), ' ');
+  }
+
   Future<void> _fillQueue({int? fromPage}) async {
     _queue.clear();
     final start = fromPage ?? _currentPage;
     final end = _autoContinue ? (_totalPages ?? 0) : start;
-    final chunkMax = isSherpaOffline ? 400 : 3000;
-    for (var p = start; p <= end; p++) {
+    // Sherpa: poucos segmentos por página → menos gaps entre ONNX/WAVs (leitura contínua).
+    final chunkMax = isSherpaOffline ? 20000 : 3000;
+    for (var pg = start; pg <= end; pg++) {
       if (!mounted) return;
-      final t = (await _textForPage(p)).trim();
+      final t = (await _textForPage(pg)).trim();
       if (t.isEmpty) continue;
-      for (final part in _splitTtsWithOffsets(t, maxLen: chunkMax)) {
-        _queue.add(_Chunk(p, part.text, part.start));
+      final normalized = _normalizeTtsText(t);
+      for (final part in _splitTtsWithOffsets(
+            normalized,
+            maxLen: chunkMax,
+            splitAtParagraphs: !isSherpaOffline,
+          )) {
+        _queue.add(_Chunk(pg, part.text, part.start));
       }
     }
   }
@@ -406,74 +468,90 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
   }
 
   Future<void> _run() async {
-    while (mounted && _isPlaying && _chunkIndex < _queue.length) {
-      final c = _queue[_chunkIndex];
-      if (c.page != _currentPage) {
-        setState(() => _currentPage = c.page);
-        _persistPage();
-        await _loadPageText(_currentPage);
-      }
-      if (!mounted || !_isPlaying) return;
+    final sherpaWake = isSherpaOffline && !kIsWeb;
+    if (sherpaWake) {
+      await WakelockPlus.enable();
+    }
+    try {
+      while (mounted && _isPlaying && _chunkIndex < _queue.length) {
+        final c = _queue[_chunkIndex];
+        if (c.page != _currentPage) {
+          setState(() => _currentPage = c.page);
+          _persistPage();
+          await _loadPageText(_currentPage);
+        }
+        if (!mounted || !_isPlaying) break;
 
-      // Destacar o trecho inteiro que vai ser lido
+        if (mounted) {
+          setState(() {
+            _hlStart = c.offsetInPage;
+            _hlEnd = c.offsetInPage + c.text.length;
+          });
+          _scrollHighlightIntoView();
+        }
+
+        try {
+          if (isSherpaOffline) {
+            if (mounted) setState(() => _isGenerating = true);
+            await TtsService.instance.speak(
+              c.text,
+              volume: _playbackVolume,
+              mediaTitle: _mediaChunkTitle(c.text, c.page),
+              mediaAlbum: widget.item.displayName,
+              mediaArtUri: _coverArtUri(),
+            );
+            if (mounted) setState(() => _isGenerating = false);
+          } else {
+            await _tts.speak(c.text);
+          }
+        } catch (e) {
+          if (mounted) setState(() => _isGenerating = false);
+          if (isSherpaOffline) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('TTS offline: $e')),
+              );
+              setState(() {
+                _isPlaying = false;
+                _clearHighlight();
+              });
+            }
+            return;
+          }
+        }
+
+        if (!mounted || !_isPlaying) break;
+
+        if (_pendingJumpChunk != null) {
+          _chunkIndex = _pendingJumpChunk!;
+          _pendingJumpChunk = null;
+          continue;
+        }
+
+        if (_pendingBackChunk) {
+          _chunkIndex = max(0, _chunkIndex - 1);
+          _pendingBackChunk = false;
+          continue;
+        }
+
+        _chunkIndex++;
+      }
+
       if (mounted) {
         setState(() {
-          _hlStart = c.offsetInPage;
-          _hlEnd = c.offsetInPage + c.text.length;
-        });
-        _scrollHighlightIntoView();
-      }
-
-      try {
-        if (isSherpaOffline) {
-          if (mounted) setState(() => _isGenerating = true);
-          await TtsService.instance.speak(c.text, volume: _playbackVolume);
-          if (mounted) setState(() => _isGenerating = false);
-        } else {
-          await _tts.speak(c.text);
-        }
-      } catch (e) {
-        if (mounted) setState(() => _isGenerating = false);
-        if (isSherpaOffline) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('TTS offline: $e')),
-            );
-            setState(() {
-              _isPlaying = false;
-              _clearHighlight();
-            });
+          _isPlaying = false;
+          _isGenerating = false;
+          _clearHighlight();
+          if (_chunkIndex >= _queue.length) {
+            _queue.clear();
+            _chunkIndex = 0;
           }
-          return;
-        }
+        });
       }
-
-      if (!mounted || !_isPlaying) return;
-
-      if (_pendingJumpChunk != null) {
-        _chunkIndex = _pendingJumpChunk!;
-        _pendingJumpChunk = null;
-        continue;
+    } finally {
+      if (sherpaWake) {
+        await WakelockPlus.disable();
       }
-
-      if (_pendingBackChunk) {
-        _chunkIndex = max(0, _chunkIndex - 1);
-        _pendingBackChunk = false;
-        continue;
-      }
-
-      _chunkIndex++;
-    }
-    if (mounted) {
-      setState(() {
-        _isPlaying = false;
-        _isGenerating = false;
-        _clearHighlight();
-        if (_chunkIndex >= _queue.length) {
-          _queue.clear();
-          _chunkIndex = 0;
-        }
-      });
     }
   }
 
@@ -544,7 +622,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
     _pendingBackChunk = false;
     _pendingJumpChunk = null;
     if (isSherpaOffline) {
-      unawaited(TtsService.instance.stopPlaybackOnly());
+      unawaited(TtsService.instance.stop());
     } else {
       unawaited(_tts.stop());
     }
@@ -582,7 +660,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
       _pendingBackChunk = false;
       _pendingJumpChunk = null;
       if (isSherpaOffline) {
-        unawaited(TtsService.instance.stopPlaybackOnly());
+        unawaited(TtsService.instance.stop());
       } else {
         unawaited(_tts.stop());
       }
@@ -689,9 +767,11 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen> {
 
   @override
   void dispose() {
+    _vaultAudioStopSub?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     _persistPage();
     if (isSherpaOffline) {
-      unawaited(TtsService.instance.stopPlaybackOnly());
+      unawaited(TtsService.instance.stop());
     } else {
       unawaited(_tts.stop());
     }
@@ -1044,6 +1124,11 @@ class _ReadAloudVoiceModalContentState
           id: 'dii',
           title: 'Dii — alta',
           selected: h.isSherpaOffline && h.sherpaVoiceId == 'dii',
+        ),
+        _sherpaTile(
+          id: 'faber',
+          title: 'Faber — média',
+          selected: h.isSherpaOffline && h.sherpaVoiceId == 'faber',
         ),
         const SizedBox(height: 4),
         Text(

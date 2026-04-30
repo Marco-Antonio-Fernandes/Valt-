@@ -44,7 +44,11 @@ dependencies:
   rar: ^0.3.0
   flutter_tts: ^4.2.5
   sherpa_onnx: ^1.13.0
-  audioplayers: ^6.6.0
+  just_audio: ^0.9.46
+  audio_service: ^0.18.18
+  audio_session: ^0.1.25
+  permission_handler: ^12.0.1
+  wakelock_plus: ^1.5.2
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -74,8 +78,11 @@ flutter:
     - assets/tts/miro.onnx.json
     - assets/tts/dii.onnx
     - assets/tts/dii.onnx.json
+    - assets/tts/faber.onnx
+    - assets/tts/faber.onnx.json
     - assets/tts/tokens_miro.txt
     - assets/tts/tokens_dii.txt
+    - assets/tts/tokens_faber.txt
     - assets/tts/espeak-ng-data/
     - assets/tts/espeak-ng-data/lang/
     - assets/tts/espeak-ng-data/lang/aav/

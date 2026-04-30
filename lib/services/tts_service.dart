@@ -2,19 +2,21 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:just_audio/just_audio.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart';
 
+import 'vault_reading_audio.dart';
+
 /// Nova pasta quando os ficheiros em cache ficam estragados (ex.: cópias
 /// incompletas) — faz com que todos os ONNX/tokens/etc. voltem a ser escritos.
 /// Bump quando mudar formato da cache (ex.: normalização CRLF nos `.txt`).
-const String _ttsCacheDirName = 'vault_sherpa_tts_v4';
+const String _ttsCacheDirName = 'vault_sherpa_tts_v5';
 
-/// VITS/Piper offline via Sherpa-ONNX (`miro`, `dii`).
+/// VITS/Piper offline via Sherpa-ONNX (`miro`, `dii`, `faber`).
 ///
 /// Incluir em `assets/tts/` (e pubspec): `*.onnx`, tokens, `.onnx.json` e
 /// `espeak-ng-data/` completa (phonemas PT‑BR — necessária).
@@ -25,6 +27,7 @@ class TtsService {
   static final _tokensByModel = <String, String>{
     'miro': 'tokens_miro.txt',
     'dii': 'tokens_dii.txt',
+    'faber': 'tokens_faber.txt',
   };
 
   OfflineTts? _tts;
@@ -32,8 +35,9 @@ class TtsService {
   Directory? _cacheDir;
 
   Future<void>? _bundlesCopied;
-  AudioPlayer? _player;
-  StreamSubscription<void>? _completeSub;
+  AudioPlayer? _fallbackPlayer;
+  StreamSubscription<PlayerState>? _fallbackStateSub;
+  Completer<void>? _fallbackPlaybackDone;
 
   String? get currentModel => _loadedModel;
 
@@ -43,30 +47,30 @@ class TtsService {
   }
 
   void dispose() {
-    _completeSub?.cancel();
-    _completeSub = null;
-    try {
-      _player?.stop();
-    } catch (_) {}
-    _finalizePlaybackCompleter();
+    _fallbackStateSub?.cancel();
+    _fallbackStateSub = null;
+    _finalizeFallbackPlaybackCompleter();
+    final pl = _fallbackPlayer;
+    _fallbackPlayer = null;
+    if (pl != null) {
+      unawaited(pl.dispose());
+    }
+    if (VaultReadingAudio.isReady) {
+      unawaited(VaultReadingAudio.handler?.interruptPlayback());
+    }
     _tts?.free();
     _tts = null;
     _loadedModel = null;
-    final pl = _player;
-    _player = null;
-    unawaited(pl?.dispose());
   }
 
-  Future<void> stopPlaybackOnly() async {
-    await stop();
-  }
+
 
   Future<void> initTts(String modelName) async {
     final normalized = modelName.toLowerCase().trim();
     final tokensLeaf = _tokensByModel[normalized];
     if (tokensLeaf == null) {
       throw ArgumentError(
-        'modelName: usar miro ou dii (recebido: $modelName)',
+        'modelName: usar miro, dii ou faber (recebido: $modelName)',
       );
     }
     await _ensureBundlesCopied();
@@ -146,29 +150,30 @@ class TtsService {
   }
 
   double _outputVolume = 1.0;
-  Completer<void>? _playbackDone;
 
   Future<void> setOutputVolume(double v) async {
     _outputVolume = v.clamp(0.0, 1.0);
-    await _player?.setVolume(_outputVolume);
+    await VaultReadingAudio.handler?.setOutputVolume(_outputVolume);
+    await _fallbackPlayer?.setVolume(_outputVolume);
   }
 
-  Future<void> speak(String text, {double volume = -1}) async {
+  Future<void> speak(
+    String text, {
+    double volume = -1,
+    String? mediaTitle,
+    String? mediaAlbum,
+    Uri? mediaArtUri,
+  }) async {
     final engine = _tts;
     if (engine == null) {
       throw StateError('TtsService.initTts antes de speak');
     }
-    if (text.trim().isEmpty) {
-      return;
-    }
+    if (text.trim().isEmpty) return;
     if (volume >= 0) {
       _outputVolume = volume.clamp(0.0, 1.0);
     }
 
-    await _player?.stop();
-    await _completeSub?.cancel();
-    _completeSub = null;
-    _finalizePlaybackCompleter();
+    await _stopPlaybackPipeline();
 
     final wav = engine.generate(text: text, sid: 0, speed: 1.0);
     if (wav.samples.isEmpty || wav.sampleRate <= 0) {
@@ -185,39 +190,89 @@ class TtsService {
       sampleRate: wav.sampleRate,
     );
 
-    _player ??= AudioPlayer();
-
-    await _player!.setVolume(_outputVolume);
-
-    final done = Completer<void>();
-    _playbackDone = done;
-    _completeSub = _player!.onPlayerComplete.listen((_) {
-      _finalizePlaybackCompleter();
-      unawaited(_completeSub?.cancel());
-      _completeSub = null;
+    try {
+      if (VaultReadingAudio.isReady && VaultReadingAudio.handler != null) {
+        await VaultReadingAudio.handler!.playVaultChunk(
+          path: out.path,
+          title: mediaTitle ?? 'Leitura',
+          album: mediaAlbum ?? 'Vault',
+          volume: _outputVolume,
+          artUri: mediaArtUri,
+        );
+      } else {
+        await _speakWithFallbackPlayer(out.path);
+      }
+    } finally {
       try {
-        if (out.existsSync()) {
-          out.deleteSync();
-        }
+        if (out.existsSync()) out.deleteSync();
       } catch (_) {}
-    });
-    await _player!.play(DeviceFileSource(out.path));
-    await done.future;
+    }
   }
 
-  void _finalizePlaybackCompleter() {
-    final c = _playbackDone;
+  void _finalizeFallbackPlaybackCompleter() {
+    final c = _fallbackPlaybackDone;
     if (c != null && !c.isCompleted) {
       c.complete();
     }
-    _playbackDone = null;
+    _fallbackPlaybackDone = null;
+  }
+
+  Future<void> _speakWithFallbackPlayer(String path) async {
+    _fallbackStateSub?.cancel();
+    _fallbackStateSub = null;
+    final old = _fallbackPlayer;
+    _fallbackPlayer = null;
+    _finalizeFallbackPlaybackCompleter();
+    if (old != null) {
+      try {
+        await old.dispose();
+      } catch (_) {}
+    }
+
+    final player = AudioPlayer();
+    _fallbackPlayer = player;
+    await player.setVolume(_outputVolume);
+
+    final done = Completer<void>();
+    _fallbackPlaybackDone = done;
+    _fallbackStateSub = player.playerStateStream.listen((s) {
+      if (s.processingState == ProcessingState.completed) {
+        _fallbackStateSub?.cancel();
+        _fallbackStateSub = null;
+        _finalizeFallbackPlaybackCompleter();
+      }
+    });
+
+    await player.setFilePath(path);
+    await player.play();
+    await done.future;
+    _fallbackStateSub?.cancel();
+    _fallbackStateSub = null;
+    _fallbackPlayer = null;
+    await player.dispose();
+  }
+
+  Future<void> _stopPlaybackPipeline() async {
+    if (VaultReadingAudio.isReady) {
+      await VaultReadingAudio.handler?.interruptPlayback();
+    }
+    _fallbackStateSub?.cancel();
+    _fallbackStateSub = null;
+    final old = _fallbackPlayer;
+    _fallbackPlayer = null;
+    _finalizeFallbackPlaybackCompleter();
+    if (old != null) {
+      try {
+        await old.stop();
+      } catch (_) {}
+      try {
+        await old.dispose();
+      } catch (_) {}
+    }
   }
 
   Future<void> stop() async {
-    await _completeSub?.cancel();
-    _completeSub = null;
-    await _player?.stop();
-    _finalizePlaybackCompleter();
+    await _stopPlaybackPipeline();
   }
 
   Future<void> _ensureBundlesCopied() async {
@@ -233,6 +288,7 @@ class TtsService {
         'vault_sherpa_tts',
         'vault_sherpa_tts_v2',
         'vault_sherpa_tts_v3',
+        'vault_sherpa_tts_v4',
       ]) {
         try {
           final d = Directory(p.join(doc.path, legacyName));
