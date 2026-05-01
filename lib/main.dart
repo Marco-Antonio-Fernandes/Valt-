@@ -59,6 +59,7 @@ class _VaultAppState extends State<VaultApp> {
     return MaterialApp(
       navigatorKey: widget.navigatorKey,
       title: 'Vault',
+      debugShowCheckedModeBanner: false,
       theme: d,
       darkTheme: d,
       themeMode: ThemeMode.dark,

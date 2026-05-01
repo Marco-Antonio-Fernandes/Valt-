@@ -66,7 +66,16 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   var _isPlaying = false;
   var _autoContinue = true;
   final List<_Chunk> _queue = [];
+  /// Texto normalizado por página quando a fila é preenchida (evita reler o PDF ao mudar de página).
+  final Map<int, String> _pageTextFromQueue = {};
   int _chunkIndex = 0;
+  /// Invalida pré-cálculo Sherpa em stop/skip — o futuro descarta o WAV órfão.
+  int _readingPrefetchGeneration = 0;
+  /// Próximo segmento (índice na fila = `_chunkIndex + 1` após consumir o atual).
+  Future<String?>? _sherpaNextWav;
+  /// Segundo à frente, iniciado quando o primeiro prefetch completa.
+  Future<String?>? _sherpaSpareWav;
+  int? _sherpaSpareForQueueIndex;
   int? _hlStart;
   int? _hlEnd;
   final ScrollController _scrollController = ScrollController();
@@ -191,6 +200,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     });
 
     _queue.clear();
+    _pageTextFromQueue.clear();
     _chunkIndex = 0;
   }
 
@@ -212,6 +222,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _readAloudEngine = 'system';
     });
     _queue.clear();
+    _pageTextFromQueue.clear();
     _chunkIndex = 0;
   }
 
@@ -280,6 +291,53 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _currentPage - 1,
       totalPages: _totalPages,
     );
+  }
+
+  void _bumpReadingPrefetchGen() {
+    _readingPrefetchGeneration++;
+  }
+
+  Future<String?> _prepareSherpaWavIfActive(String text, int genAtSchedule) async {
+    final path = await TtsService.instance.prepareWavForText(text);
+    if (!mounted ||
+        !_isPlaying ||
+        genAtSchedule != _readingPrefetchGeneration) {
+      try {
+        File(path).deleteSync();
+      } catch (_) {}
+      return null;
+    }
+    return path;
+  }
+
+  void _attachSherpaSpareChain(
+    Future<String?>? primary,
+    int primaryQueueIndex,
+    int gen,
+  ) {
+    if (primary == null) return;
+    unawaited(primary.then((p) {
+      if (p == null) return;
+      if (!mounted || !_isPlaying || gen != _readingPrefetchGeneration) return;
+      final n = primaryQueueIndex + 1;
+      if (n < _queue.length && _sherpaSpareWav == null) {
+        _sherpaSpareWav = _prepareSherpaWavIfActive(_queue[n].text, gen);
+        _sherpaSpareForQueueIndex = n;
+      }
+    }));
+  }
+
+  /// Agenda síntese para `queueIndex` e, ao concluir, a do segmento seguinte.
+  void _scheduleSherpaPrefetchFromQueueIndex(int queueIndex, int gen) {
+    if (queueIndex >= _queue.length) return;
+    _sherpaNextWav = _prepareSherpaWavIfActive(_queue[queueIndex].text, gen);
+    _attachSherpaSpareChain(_sherpaNextWav, queueIndex, gen);
+  }
+
+  void _clearSherpaPrefetchFutures() {
+    _sherpaNextWav = null;
+    _sherpaSpareWav = null;
+    _sherpaSpareForQueueIndex = null;
   }
 
   void _clearHighlight() {
@@ -418,6 +476,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   Future<void> _fillQueue({int? fromPage}) async {
     _queue.clear();
+    _pageTextFromQueue.clear();
     final start = fromPage ?? _currentPage;
     final end = _autoContinue ? (_totalPages ?? 0) : start;
     // Sherpa: poucos segmentos por página → menos gaps entre ONNX/WAVs (leitura contínua).
@@ -427,6 +486,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       final t = (await _textForPage(pg)).trim();
       if (t.isEmpty) continue;
       final normalized = _normalizeTtsText(t);
+      _pageTextFromQueue[pg] = normalized;
       for (final part in _splitTtsWithOffsets(
             normalized,
             maxLen: chunkMax,
@@ -473,12 +533,29 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       await WakelockPlus.enable();
     }
     try {
+      _clearSherpaPrefetchFutures();
       while (mounted && _isPlaying && _chunkIndex < _queue.length) {
+        final g0 = _readingPrefetchGeneration;
         final c = _queue[_chunkIndex];
         if (c.page != _currentPage) {
           setState(() => _currentPage = c.page);
           _persistPage();
-          await _loadPageText(_currentPage);
+          final cached = _pageTextFromQueue[c.page];
+          if (cached != null) {
+            setState(() {
+              if (cached.isEmpty) {
+                _pageText =
+                    '(Sem texto selecionável nesta página.)';
+                _pagePlain = '';
+              } else {
+                _pageText = cached;
+                _pagePlain = cached;
+              }
+              _clearHighlight();
+            });
+          } else {
+            await _loadPageText(_currentPage);
+          }
         }
         if (!mounted || !_isPlaying) break;
 
@@ -492,15 +569,53 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
         try {
           if (isSherpaOffline) {
-            if (mounted) setState(() => _isGenerating = true);
-            await TtsService.instance.speak(
-              c.text,
+            var pref = _sherpaNextWav;
+            _sherpaNextWav = null;
+
+            if (pref == null &&
+                _sherpaSpareWav != null &&
+                _sherpaSpareForQueueIndex == _chunkIndex) {
+              pref = _sherpaSpareWav;
+              _sherpaSpareWav = null;
+              _sherpaSpareForQueueIndex = null;
+            }
+
+            final usePrefetch = pref != null;
+            if (mounted && !usePrefetch) {
+              setState(() => _isGenerating = true);
+            }
+
+            var wavPath = pref != null ? await pref : null;
+            wavPath ??= await _prepareSherpaWavIfActive(c.text, g0);
+
+            if (mounted) setState(() => _isGenerating = false);
+
+            if (wavPath == null) {
+              if (!mounted || !_isPlaying) break;
+              break;
+            }
+
+            final gen1 = _readingPrefetchGeneration;
+            final nextIdx = _chunkIndex + 1;
+            if (nextIdx < _queue.length) {
+              if (_sherpaSpareWav != null &&
+                  _sherpaSpareForQueueIndex == nextIdx) {
+                _sherpaNextWav = _sherpaSpareWav;
+                _sherpaSpareWav = null;
+                _sherpaSpareForQueueIndex = null;
+                _attachSherpaSpareChain(_sherpaNextWav, nextIdx, gen1);
+              } else {
+                _scheduleSherpaPrefetchFromQueueIndex(nextIdx, gen1);
+              }
+            }
+
+            await TtsService.instance.playPreparedWav(
+              wavPath,
               volume: _playbackVolume,
               mediaTitle: _mediaChunkTitle(c.text, c.page),
               mediaAlbum: widget.item.displayName,
               mediaArtUri: _coverArtUri(),
             );
-            if (mounted) setState(() => _isGenerating = false);
           } else {
             await _tts.speak(c.text);
           }
@@ -523,12 +638,16 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         if (!mounted || !_isPlaying) break;
 
         if (_pendingJumpChunk != null) {
+          _bumpReadingPrefetchGen();
+          _clearSherpaPrefetchFutures();
           _chunkIndex = _pendingJumpChunk!;
           _pendingJumpChunk = null;
           continue;
         }
 
         if (_pendingBackChunk) {
+          _bumpReadingPrefetchGen();
+          _clearSherpaPrefetchFutures();
           _chunkIndex = max(0, _chunkIndex - 1);
           _pendingBackChunk = false;
           continue;
@@ -544,6 +663,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
           _clearHighlight();
           if (_chunkIndex >= _queue.length) {
             _queue.clear();
+            _pageTextFromQueue.clear();
             _chunkIndex = 0;
           }
         });
@@ -618,6 +738,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   // ─── Playback controls ───
 
   void _stopPlayback() {
+    _bumpReadingPrefetchGen();
+    _clearSherpaPrefetchFutures();
     _isPlaying = false;
     _pendingBackChunk = false;
     _pendingJumpChunk = null;
@@ -638,6 +760,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _stopPlayback();
     if (_currentPage <= 1) return;
     _queue.clear();
+    _pageTextFromQueue.clear();
     _chunkIndex = 0;
     setState(() => _currentPage--);
     _persistPage();
@@ -648,6 +771,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _stopPlayback();
     if (_totalPages == null || _currentPage >= _totalPages!) return;
     _queue.clear();
+    _pageTextFromQueue.clear();
     _chunkIndex = 0;
     setState(() => _currentPage++);
     _persistPage();
@@ -656,6 +780,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   void _onTogglePlayPause() {
     if (_isPlaying) {
+      _bumpReadingPrefetchGen();
+      _clearSherpaPrefetchFutures();
       _isPlaying = false;
       _pendingBackChunk = false;
       _pendingJumpChunk = null;
@@ -767,6 +893,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   @override
   void dispose() {
+    _bumpReadingPrefetchGen();
     _vaultAudioStopSub?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _persistPage();
@@ -915,6 +1042,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                                 if (page == _currentPage) return;
                                 _stopPlayback();
                                 _queue.clear();
+                                _pageTextFromQueue.clear();
                                 _chunkIndex = 0;
                                 setState(() => _currentPage = page);
                                 _persistPage();

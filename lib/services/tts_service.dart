@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:sherpa_onnx/sherpa_onnx.dart';
 
+import 'sherpa_tts_isolate.dart';
 import 'vault_reading_audio.dart';
 
 /// Nova pasta quando os ficheiros em cache ficam estragados (ex.: cópias
@@ -30,8 +31,7 @@ class TtsService {
     'faber': 'tokens_faber.txt',
   };
 
-  OfflineTts? _tts;
-  String? _loadedModel;
+  String? _workerLoadedModel;
   Directory? _cacheDir;
 
   Future<void>? _bundlesCopied;
@@ -39,7 +39,14 @@ class TtsService {
   StreamSubscription<PlayerState>? _fallbackStateSub;
   Completer<void>? _fallbackPlaybackDone;
 
-  String? get currentModel => _loadedModel;
+  Isolate? _ttsIsolate;
+  ReceivePort? _ttsMainReceive;
+  StreamSubscription<Object?>? _ttsReplySub;
+  SendPort? _ttsWorkerSend;
+  var _ttsReqId = 0;
+  final Map<int, Completer<String>> _ttsPending = {};
+
+  String? get currentModel => _workerLoadedModel;
 
   Future<void> ensureBundlesAndInit(String modelName) async {
     await _ensureBundlesCopied();
@@ -58,14 +65,53 @@ class TtsService {
     if (VaultReadingAudio.isReady) {
       unawaited(VaultReadingAudio.handler?.interruptPlayback());
     }
-    _tts?.free();
-    _tts = null;
-    _loadedModel = null;
+    _shutdownTtsWorker();
+  }
+
+  void _shutdownTtsWorker() {
+    _ttsReplySub?.cancel();
+    _ttsReplySub = null;
+    final send = _ttsWorkerSend;
+    _ttsWorkerSend = null;
+    if (send != null) {
+      try {
+        send.send(<String, Object?>{'op': 'shutdown'});
+      } catch (_) {}
+    }
+    _ttsIsolate?.kill(priority: Isolate.immediate);
+    _ttsIsolate = null;
+    _ttsMainReceive?.close();
+    _ttsMainReceive = null;
+    for (final c in _ttsPending.values) {
+      if (!c.isCompleted) {
+        c.completeError(StateError('TTS offline encerrado'));
+      }
+    }
+    _ttsPending.clear();
+    _workerLoadedModel = null;
+  }
+
+  void _onWorkerReply(Object? msg) {
+    if (msg is! Map) return;
+    final m = Map<String, Object?>.from(msg);
+    final id = m['id'] as int?;
+    if (id == null) return;
+    final c = _ttsPending.remove(id);
+    if (c == null) return;
+    if (m['ok'] == true) {
+      c.complete(m['path']! as String);
+    } else {
+      c.completeError(StateError(m['error']?.toString() ?? 'erro TTS'));
+    }
   }
 
 
 
   Future<void> initTts(String modelName) async {
+    if (kIsWeb) {
+      throw StateError('Sherpa ONNX não está disponível na web.');
+    }
+
     final normalized = modelName.toLowerCase().trim();
     final tokensLeaf = _tokensByModel[normalized];
     if (tokensLeaf == null) {
@@ -96,7 +142,7 @@ class TtsService {
       );
     }
 
-    if (_loadedModel == normalized && _tts != null) {
+    if (_workerLoadedModel == normalized && _ttsWorkerSend != null) {
       return;
     }
 
@@ -118,17 +164,6 @@ class TtsService {
       /* metadados opcionais */
     }
 
-    _tts?.free();
-
-    final vits = OfflineTtsVitsModelConfig(
-      model: onnxPath,
-      tokens: tokensPath,
-      dataDir: dataDirPath,
-      noiseScale: noiseScale,
-      noiseScaleW: noiseScaleW,
-      lengthScale: lengthScale,
-    );
-
     final threads = (!kIsWeb &&
             (Platform.isAndroid ||
                 Platform.isIOS ||
@@ -137,16 +172,49 @@ class TtsService {
         ? 1
         : 2;
 
-    final modelCfg = OfflineTtsModelConfig(
-      vits: vits,
-      numThreads: threads,
-      debug: kDebugMode,
-      provider: 'cpu',
-    );
-    final cfg = OfflineTtsConfig(model: modelCfg);
+    _shutdownTtsWorker();
 
-    _tts = OfflineTts(cfg);
-    _loadedModel = normalized;
+    final mainRp = ReceivePort();
+    _ttsMainReceive = mainRp;
+    final initMap = <String, Object?>{
+      'onnx': onnxPath,
+      'tokens': tokensPath,
+      'dataDir': dataDirPath,
+      'noiseScale': noiseScale,
+      'noiseScaleW': noiseScaleW,
+      'lengthScale': lengthScale,
+      'numThreads': threads,
+    };
+
+    final boot = Completer<SendPort>();
+    late StreamSubscription<Object?> sub;
+    sub = mainRp.listen((Object? msg) {
+      if (msg is SendPort && !boot.isCompleted) {
+        boot.complete(msg);
+        return;
+      }
+      _onWorkerReply(msg);
+    });
+
+    try {
+      final isolate = await Isolate.spawn(
+        sherpaTtsWorkerMain,
+        [mainRp.sendPort, initMap],
+        debugName: 'vault_sherpa_tts',
+      );
+
+      _ttsIsolate = isolate;
+      _ttsReplySub = sub;
+      _ttsWorkerSend = await boot.future;
+      _workerLoadedModel = normalized;
+    } catch (e) {
+      await sub.cancel();
+      mainRp.close();
+      _ttsMainReceive = null;
+      _ttsReplySub = null;
+      _ttsIsolate = null;
+      rethrow;
+    }
   }
 
   double _outputVolume = 1.0;
@@ -164,10 +232,6 @@ class TtsService {
     String? mediaAlbum,
     Uri? mediaArtUri,
   }) async {
-    final engine = _tts;
-    if (engine == null) {
-      throw StateError('TtsService.initTts antes de speak');
-    }
     if (text.trim().isEmpty) return;
     if (volume >= 0) {
       _outputVolume = volume.clamp(0.0, 1.0);
@@ -175,36 +239,80 @@ class TtsService {
 
     await _stopPlaybackPipeline();
 
-    final wav = engine.generate(text: text, sid: 0, speed: 1.0);
-    if (wav.samples.isEmpty || wav.sampleRate <= 0) {
-      throw StateError('TTS não gerou áudio.');
+    final path = await prepareWavForText(text);
+    await playPreparedWav(
+      path,
+      volume: volume,
+      mediaTitle: mediaTitle,
+      mediaAlbum: mediaAlbum,
+      mediaArtUri: mediaArtUri,
+    );
+  }
+
+  /// Gera WAV sem interromper o áudio atual — corre num isolate (não trava a UI).
+  Future<String> prepareWavForText(String text) async {
+    if (kIsWeb) {
+      throw StateError('Sherpa ONNX não está disponível na web.');
+    }
+    final worker = _ttsWorkerSend;
+    if (worker == null) {
+      throw StateError('TtsService.initTts antes de speak');
+    }
+    if (text.trim().isEmpty) {
+      throw StateError('texto vazio');
     }
 
+    final id = ++_ttsReqId;
     final root = await getTemporaryDirectory();
     final out = File(
-      p.join(root.path, 'vault_tts_${DateTime.now().microsecondsSinceEpoch}.wav'),
+      p.join(
+        root.path,
+        'vault_tts_${id}_${DateTime.now().microsecondsSinceEpoch}.wav',
+      ),
     );
-    writeWave(
-      filename: out.path,
-      samples: wav.samples,
-      sampleRate: wav.sampleRate,
-    );
+    final c = Completer<String>();
+    _ttsPending[id] = c;
+    worker.send(<String, Object?>{
+      'op': 'gen',
+      'id': id,
+      'text': text,
+      'outPath': out.path,
+    });
+    return c.future;
+  }
+
+  /// Reproduz um WAV já gerado (e apaga o ficheiro no fim). Interrompe o segmento anterior.
+  Future<void> playPreparedWav(
+    String path, {
+    double volume = -1,
+    String? mediaTitle,
+    String? mediaAlbum,
+    Uri? mediaArtUri,
+  }) async {
+    if (!await File(path).exists()) {
+      throw StateError('WAV em falta: $path');
+    }
+    if (volume >= 0) {
+      _outputVolume = volume.clamp(0.0, 1.0);
+    }
 
     try {
       if (VaultReadingAudio.isReady && VaultReadingAudio.handler != null) {
         await VaultReadingAudio.handler!.playVaultChunk(
-          path: out.path,
+          path: path,
           title: mediaTitle ?? 'Leitura',
           album: mediaAlbum ?? 'Vault',
           volume: _outputVolume,
           artUri: mediaArtUri,
         );
       } else {
-        await _speakWithFallbackPlayer(out.path);
+        await _speakWithFallbackPlayer(path);
       }
     } finally {
       try {
-        if (out.existsSync()) out.deleteSync();
+        if (await File(path).exists()) {
+          await File(path).delete();
+        }
       } catch (_) {}
     }
   }
