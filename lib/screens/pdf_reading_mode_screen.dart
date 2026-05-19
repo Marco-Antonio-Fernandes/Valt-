@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File;
+import 'dart:io' show File, Platform;
 import 'dart:math' show max, min;
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show RenderParagraph;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -21,10 +21,10 @@ const _kVoicePrefsKey = 'read_aloud_voice_json';
 const _kReadAloudEngine = 'read_aloud_engine';
 const _kSherpaOfflineVoice = 'offline_sherpa_voice_id';
 const _kReadAloudVolume = 'read_aloud_playback_volume';
+const _kSystemSpeechRate = 'read_aloud_system_speech_rate';
+const _kWavPlaybackSpeed = 'read_aloud_wav_playback_speed';
 const _defaultVoiceLocale = 'pt-BR';
-const _readAloudBlue = Color(0xFF1565C0);
-const _highlightBg = Color(0xFF5B4A1E);
-const _highlightFg = Color(0xFFFFF8E1);
+const _readHighlightFill = Color(0x991565C0);
 
 class PdfReadingModeScreen extends StatefulWidget {
   const PdfReadingModeScreen({
@@ -56,18 +56,22 @@ bool _isLocalePtBr(String? raw) {
 class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     with WidgetsBindingObserver {
   final FlutterTts _tts = FlutterTts();
-  PdfDocument? _doc;
+  final PdfViewerController _pdfController = PdfViewerController();
+
   int _currentPage = 1;
   int? _totalPages;
-  var _pageText = '';
-  var _pagePlain = '';
-  var _loadingDoc = true;
+  var _viewerReady = false;
   String? _loadError;
   var _isPlaying = false;
+  /// Pausa suave — mantém posição no segmento; [stop] é que reinicia a sessão.
+  var _paused = false;
+  Completer<void>? _resumeCompleter;
+
   var _autoContinue = true;
   final List<_Chunk> _queue = [];
-  /// Texto normalizado por página quando a fila é preenchida (evita reler o PDF ao mudar de página).
+  /// Texto por página (índices alinhados com [PdfPageText] para destaque no PDF).
   final Map<int, String> _pageTextFromQueue = {};
+  final Map<int, PdfPageText> _structuredByPage = {};
   int _chunkIndex = 0;
   /// Invalida pré-cálculo Sherpa em stop/skip — o futuro descarta o WAV órfão.
   int _readingPrefetchGeneration = 0;
@@ -76,12 +80,24 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   /// Segundo à frente, iniciado quando o primeiro prefetch completa.
   Future<String?>? _sherpaSpareWav;
   int? _sherpaSpareForQueueIndex;
-  int? _hlStart;
-  int? _hlEnd;
-  final ScrollController _scrollController = ScrollController();
-  final _textKey = GlobalKey();
+  PdfPageTextRange? _readHighlight;
+  /// Evita redesenhar o PDF demasiadas vezes durante o FlutterTts (economiza CPU/GPU).
+  DateTime? _lastProgressRedraw;
 
   StreamSubscription<void>? _vaultAudioStopSub;
+  StreamSubscription<VaultReadingSegmentSkip>? _vaultSegmentSkipSub;
+  StreamSubscription<(Duration position, Duration? duration)>?
+      _wavProgressSub;
+
+  var _speechRate = 0.45;
+  var _wavPlaybackSpeed = 1.0;
+  /// Avanço aproximado na frase atual (motor do sistema) — apenas visual.
+  var _flutterWordProgress = 0.0;
+
+  Duration? _wavChunkPos;
+  Duration? _wavChunkDur;
+  var _wavScrubbingSherpa = false;
+  var _wavScrubFraction = 0.0;
 
   var _playbackVolume = 1.0;
   var _pendingBackChunk = false;
@@ -97,13 +113,24 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   @override
   void initState() {
     super.initState();
+    _currentPage = (widget.item.lastPageIndex + 1).clamp(1, 1 << 20);
+    _totalPages = widget.item.totalPages;
     WidgetsBinding.instance.addObserver(this);
     _vaultAudioStopSub = VaultReadingAudio.systemStopRequests.listen((_) {
       if (!mounted) return;
       _stopPlayback();
     });
+    _vaultSegmentSkipSub =
+        VaultReadingAudio.segmentSkips.listen((VaultReadingSegmentSkip s) {
+      if (!mounted || !_isPlaying) return;
+      switch (s) {
+        case VaultReadingSegmentSkip.forward:
+          _seekNextSegment();
+        case VaultReadingSegmentSkip.backward:
+          _seekPreviousSegment();
+      }
+    });
     unawaited(_bootstrapTts());
-    unawaited(_loadDocument());
   }
 
   @override
@@ -126,6 +153,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _sherpaOfflineVoice = sv;
     }
     _playbackVolume = (p.getDouble(_kReadAloudVolume) ?? 1.0).clamp(0.0, 1.0);
+    _speechRate = (p.getDouble(_kSystemSpeechRate) ?? 0.45).clamp(0.22, 0.92);
+    _wavPlaybackSpeed =
+        (p.getDouble(_kWavPlaybackSpeed) ?? 1.0).clamp(0.6, 1.75);
     await _initSystemTts();
     await _applyPlaybackVolumeToEngines();
   }
@@ -138,6 +168,56 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   Future<void> _persistPlaybackVolume() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_kReadAloudVolume, _playbackVolume);
+  }
+
+  Future<void> _persistSpeechSpeeds() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_kSystemSpeechRate, _speechRate);
+    await prefs.setDouble(_kWavPlaybackSpeed, _wavPlaybackSpeed);
+  }
+
+  Future<void> _ensureSherpaInfrastructure() async {
+    if (!isSherpaOffline || kIsWeb) return;
+    if (Platform.isAndroid || Platform.isIOS) {
+      await VaultReadingAudio.init();
+      _attachSherpaWavProgressListener();
+    }
+    await TtsService.instance.ensureBundlesAndInit(_sherpaOfflineVoice);
+  }
+
+  /// [VaultReadingAudio.wavProgress] em initState era sempre `Stream.empty()` porque o
+  /// handler só existe depois de [VaultReadingAudio.init] — tens de subscrever aqui.
+  void _attachSherpaWavProgressListener() {
+    if (!isSherpaOffline || kIsWeb || !VaultReadingAudio.isReady) return;
+    _wavProgressSub?.cancel();
+    _wavProgressSub = VaultReadingAudio.wavProgress.listen((tick) {
+      if (!mounted || !isSherpaOffline || !_isPlaying || _paused) return;
+      final pos = tick.$1;
+      final d = tick.$2;
+      setState(() {
+        _wavChunkPos = pos;
+        if (d != null && d.inMilliseconds > 0) {
+          _wavChunkDur = d;
+        }
+        if (!_wavScrubbingSherpa &&
+            _queue.isNotEmpty &&
+            _chunkIndex < _queue.length) {
+          final dm = (_wavChunkDur ?? Duration.zero).inMilliseconds;
+          final tAudio = dm <= 0
+              ? 0.0
+              : (pos.inMilliseconds / dm).clamp(0.0, 1.0);
+          _applyReadHighlightChunkProgress(_queue[_chunkIndex], tAudio);
+        }
+        if (_pdfController.isReady) {
+          _pdfController.invalidate();
+        }
+      });
+    });
+  }
+
+  void _detachSherpaWavProgressListener() {
+    _wavProgressSub?.cancel();
+    _wavProgressSub = null;
   }
 
   String _mediaChunkTitle(String text, int page) {
@@ -159,7 +239,17 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     return Uri.file(f.path);
   }
 
+  void _completeResumeWaitIfAny() {
+    final c = _resumeCompleter;
+    if (c != null && !c.isCompleted) {
+      c.complete();
+    }
+    _resumeCompleter = null;
+  }
+
   void _interruptChunkPlayback() {
+    _paused = false;
+    _completeResumeWaitIfAny();
     if (isSherpaOffline) {
       unawaited(TtsService.instance.stop());
     } else {
@@ -221,6 +311,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     setState(() {
       _readAloudEngine = 'system';
     });
+    _detachSherpaWavProgressListener();
     _queue.clear();
     _pageTextFromQueue.clear();
     _chunkIndex = 0;
@@ -236,28 +327,56 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     }
   }
 
+  void _onFlutterTtsProgress(String text, int startOffset, int endOffset, String word) {
+    if (!mounted || _paused) return;
+    if (_queue.isEmpty || _chunkIndex >= _queue.length) return;
+    final chunk = _queue[_chunkIndex];
+    final pageText = _structuredByPage[chunk.page];
+    if (pageText == null) return;
+    final now = DateTime.now();
+    if (_lastProgressRedraw != null &&
+        now.difference(_lastProgressRedraw!).inMilliseconds < 110) {
+      return;
+    }
+    _lastProgressRedraw = now;
+    var a = chunk.offsetInPage + startOffset;
+    var b = chunk.offsetInPage + endOffset;
+    final len = pageText.fullText.length;
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (a > b) return;
+    final clen = chunk.text.length;
+    final nextProg = clen <= 0
+        ? 0.0
+        : ((endOffset < 0 ? 0 : endOffset).toDouble().clamp(
+              0.0,
+              clen.toDouble(),
+            ) /
+            clen);
+    final nextHighlight = PdfPageTextRange(
+      pageText: pageText,
+      start: a,
+      end: b,
+    );
+    final hlSame = _sameReadHighlight(nextHighlight);
+    final progJump = (_flutterWordProgress - nextProg).abs() >= 0.02;
+    if (hlSame && !progJump) return;
+    if (!hlSame) {
+      _readHighlight = nextHighlight;
+      if (_pdfController.isReady) {
+        _pdfController.invalidate();
+      }
+    }
+    _flutterWordProgress = nextProg;
+    setState(() {});
+  }
+
   Future<void> _initSystemTts() async {
     await _tts.awaitSpeakCompletion(true);
-    await _tts.setSpeechRate(0.45);
+    await _tts.setSpeechRate(_speechRate);
     await _tts.setVolume(_playbackVolume.clamp(0.0, 1.0));
     if (!kIsWeb && !isSherpaOffline) {
-      _tts.setProgressHandler((_, startOffset, endOffset, _) {
-        if (!mounted) return;
-        if (_queue.isEmpty || _chunkIndex >= _queue.length) return;
-        final chunk = _queue[_chunkIndex];
-        final len = _pagePlain.length;
-        if (len == 0) return;
-        var a = chunk.offsetInPage + startOffset;
-        var b = chunk.offsetInPage + endOffset;
-        if (a < 0) a = 0;
-        if (b > len) b = len;
-        if (a > b) return;
-        setState(() {
-          _hlStart = a;
-          _hlEnd = b;
-        });
-        _scrollHighlightIntoView();
-      });
+      _tts.setProgressHandler(_onFlutterTtsProgress);
     }
 
     if (isSherpaOffline) {
@@ -293,12 +412,41 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     );
   }
 
+  /// Ao sair do ecrã: preferir o segmento da fila se existir leitura recente,
+  /// para não gravar só a página visível quando se navega durante áudio.
+  void _persistLibraryBookmarkOnExit() {
+    if (_queue.isNotEmpty && _chunkIndex < _queue.length) {
+      widget.onPagePersist?.call(
+        _queue[_chunkIndex].page - 1,
+        totalPages: _totalPages,
+      );
+    } else {
+      _persistPage();
+    }
+  }
+
+  String _subtitleForPdfAppBar(int? totalPages) {
+    if (totalPages == null) return 'A abrir PDF…';
+    final readingPage =
+        (!_isPlaying || _queue.isEmpty || _chunkIndex >= _queue.length)
+            ? null
+            : _queue[_chunkIndex].page;
+    if (readingPage != null &&
+        readingPage != _currentPage &&
+        _isPlaying) {
+      return 'A ler pág. $readingPage · A ver pág. '
+          '$_currentPage de $totalPages · PDF';
+    }
+    return 'Página $_currentPage de $totalPages · PDF no ecrã';
+  }
+
   void _bumpReadingPrefetchGen() {
     _readingPrefetchGeneration++;
   }
 
   Future<String?> _prepareSherpaWavIfActive(String text, int genAtSchedule) async {
-    final path = await TtsService.instance.prepareWavForText(text);
+    final path =
+        await TtsService.instance.prepareWavForText(_normalizeTtsText(text));
     if (!mounted ||
         !_isPlaying ||
         genAtSchedule != _readingPrefetchGeneration) {
@@ -340,88 +488,151 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _sherpaSpareForQueueIndex = null;
   }
 
+  bool _sameReadHighlight(PdfPageTextRange o) {
+    final h = _readHighlight;
+    if (h == null) return false;
+    return identical(h.pageText, o.pageText) && h.start == o.start && h.end == o.end;
+  }
+
   void _clearHighlight() {
-    _hlStart = null;
-    _hlEnd = null;
-  }
-
-  void _scrollHighlightIntoView() {
-    if (!mounted) return;
-    if (_hlStart == null || _hlStart! > _pagePlain.length) return;
-    if (!_scrollController.hasClients) return;
-    const lineHeight = 24.0;
-    const pad = 80.0;
-    final pos = min(_hlStart!, _pagePlain.length);
-    final y = min(
-      (lineHeight * (_pagePlain.substring(0, pos).split('\n').length - 1)) +
-          pad,
-      max(0.0, _scrollController.position.maxScrollExtent),
-    );
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _scrollController.hasClients) {
-        _scrollController.animateTo(
-          y,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOutCubic,
-        );
-      }
-    });
-  }
-
-  Future<void> _loadDocument() async {
-    try {
-      final doc = await PdfDocument.openFile(widget.item.filePath);
-      if (!mounted) {
-        unawaited(doc.dispose());
-        return;
-      }
-      setState(() {
-        _doc = doc;
-        _totalPages = doc.pages.length;
-        _currentPage = (widget.item.lastPageIndex + 1).clamp(
-          1,
-          doc.pages.length,
-        );
-        _loadingDoc = false;
-      });
-      _persistPage();
-      await _loadPageText(_currentPage);
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _loadingDoc = false;
-          _loadError = e.toString();
-        });
-      }
+    _lastProgressRedraw = null;
+    _flutterWordProgress = 0;
+    _readHighlight = null;
+    if (_pdfController.isReady) {
+      _pdfController.invalidate();
     }
   }
 
-  Future<String> _textForPage(int pageNum) async {
-    final doc = _doc;
-    if (doc == null || pageNum < 1 || pageNum > doc.pages.length) return '';
-    var page = doc.pages[pageNum - 1];
-    if (!page.isLoaded) page = await page.ensureLoaded();
-    final raw = await page.loadText();
-    return (raw?.fullText ?? '').replaceAll('\r\n', '\n').trim();
+  /// [linearProgress] ∈ [0,1]: fração do segmento já ouvida (Sherpa segue o WAV).
+  void _applyReadHighlightChunkProgress(_Chunk chunk, double linearProgress) {
+    final pageText = _structuredByPage[chunk.page];
+    if (pageText == null) {
+      _readHighlight = null;
+      return;
+    }
+    final fullLen = pageText.fullText.length;
+    final startIdx = chunk.offsetInPage.clamp(0, fullLen);
+    final segmentLen = chunk.text.length;
+    final tt = linearProgress.clamp(0.0, 1.0);
+    final int charsRead;
+    if (segmentLen <= 0) {
+      charsRead = 0;
+    } else if (tt >= 1.0) {
+      charsRead = segmentLen;
+    } else if (tt <= 0) {
+      // Sem isto start==end e o PDF não pinta nada até ao primeiro tick do WAV.
+      charsRead = 1;
+    } else {
+      charsRead = max(1, (segmentLen * tt).floor()).clamp(1, segmentLen);
+    }
+    final endIdx = min(startIdx + charsRead, fullLen);
+    _readHighlight = PdfPageTextRange(
+      pageText: pageText,
+      start: startIdx,
+      end: max(startIdx, endIdx),
+    );
   }
 
-  Future<void> _loadPageText(int pageNum) async {
-    if (!mounted) return;
-    setState(() => _pageText = '…');
-    final t = await _textForPage(pageNum);
-    if (!mounted) return;
-    setState(() {
-      if (t.isEmpty) {
-        _pageText = '(Sem texto selecionável nesta página.)';
-        _pagePlain = '';
-        _clearHighlight();
-      } else {
-        final display = _normalizeTtsText(t);
-        _pageText = display;
-        _pagePlain = display;
-        _clearHighlight();
-      }
+  static String _preparePageSourceText(String raw) {
+    return raw.replaceAll(RegExp(r'\r\n'), '\n').trim();
+  }
+
+  Future<PdfPageText?> _structuredForPage(int pageNum) async {
+    final cached = _structuredByPage[pageNum];
+    if (cached != null) return cached;
+
+    if (!_pdfController.isReady) return null;
+    final loaded = await _pdfController.useDocument((doc) async {
+      if (pageNum < 1 || pageNum > doc.pages.length) return null;
+      var page = doc.pages[pageNum - 1];
+      if (!page.isLoaded) page = await page.ensureLoaded();
+      return page.loadStructuredText();
     });
+    if (loaded != null) {
+      _structuredByPage[pageNum] = loaded;
+    }
+    return loaded;
+  }
+
+  void _paintReadAloudHighlight(ui.Canvas canvas, Rect pageRect, PdfPage page) {
+    final range = _readHighlight;
+    if (!_isPlaying || range == null || range.pageNumber != page.pageNumber) {
+      return;
+    }
+    final fill = ui.Paint()..color = _readHighlightFill;
+    final stroke = ui.Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.75
+      ..color = const Color(0xCFFFFFFF);
+    for (final br in range.enumerateFragmentBoundingRects()) {
+      final r = br.bounds
+          .toRect(page: page, scaledPageSize: pageRect.size)
+          .translate(pageRect.left, pageRect.top)
+          .inflate(0.85);
+      canvas.drawRect(r, fill);
+      canvas.drawRect(r, stroke);
+    }
+  }
+
+  bool _onPdfTap(
+    BuildContext context,
+    PdfViewerController controller,
+    PdfViewerGeneralTapHandlerDetails details,
+  ) {
+    if (details.type != PdfViewerGeneralTapType.tap) return false;
+    unawaited(_jumpFromDocumentTap(details.documentPosition));
+    return false;
+  }
+
+  Future<void> _jumpFromDocumentTap(Offset docPoint) async {
+    if (!_pdfController.isReady) return;
+    final pageNum = _pageNumberAtDocumentPoint(docPoint);
+    if (pageNum == null) return;
+    final charIndex = await _charIndexAtDocumentPoint(docPoint, pageNum);
+    if (charIndex == null) return;
+    if (pageNum != _currentPage) {
+      setState(() => _currentPage = pageNum);
+      if (!_isPlaying) {
+        _persistPage();
+      }
+      await _pdfController.goToPage(pageNumber: pageNum);
+    }
+    await _jumpToCharOffset(charIndex);
+  }
+
+  int? _pageNumberAtDocumentPoint(Offset docPoint) {
+    final layouts = _pdfController.layout.pageLayouts;
+    for (var i = 0; i < layouts.length; i++) {
+      if (layouts[i].contains(docPoint)) return i + 1;
+    }
+    return null;
+  }
+
+  Future<int?> _charIndexAtDocumentPoint(Offset docPoint, int pageNum) async {
+    final text = await _structuredForPage(pageNum);
+    if (text == null || !_pdfController.isReady) return null;
+    final layouts = _pdfController.layout.pageLayouts;
+    if (pageNum < 1 || pageNum > layouts.length) return null;
+    final pageRect = layouts[pageNum - 1];
+    if (!pageRect.contains(docPoint)) return null;
+    final page = _pdfController.pages[pageNum - 1];
+    final pt = docPoint
+        .translate(-pageRect.left, -pageRect.top)
+        .toPdfPoint(page: page, scaledPageSize: pageRect.size);
+    const margin = 8.0;
+    var d2Min = double.infinity;
+    int? closest;
+    for (var i = 0; i < text.charRects.length; i++) {
+      final charRect = text.charRects[i];
+      if (charRect.containsPoint(pt)) return i;
+      final d2 = charRect.distanceSquaredTo(pt);
+      if (d2 < d2Min) {
+        d2Min = d2;
+        closest = i;
+      }
+    }
+    if (closest != null && d2Min <= margin * margin) return closest;
+    return null;
   }
 
   /// Divide texto em segmentos até [maxLen], cortando preferencialmente em frases.
@@ -483,12 +694,13 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     final chunkMax = isSherpaOffline ? 20000 : 3000;
     for (var pg = start; pg <= end; pg++) {
       if (!mounted) return;
-      final t = (await _textForPage(pg)).trim();
-      if (t.isEmpty) continue;
-      final normalized = _normalizeTtsText(t);
-      _pageTextFromQueue[pg] = normalized;
+      final structured = await _structuredForPage(pg);
+      if (structured == null) continue;
+      final pageFull = _preparePageSourceText(structured.fullText);
+      if (pageFull.isEmpty) continue;
+      _pageTextFromQueue[pg] = pageFull;
       for (final part in _splitTtsWithOffsets(
-            normalized,
+            pageFull,
             maxLen: chunkMax,
             splitAtParagraphs: !isSherpaOffline,
           )) {
@@ -515,16 +727,59 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       return;
     }
 
-    if (isSherpaOffline) {
-      await TtsService.instance.ensureBundlesAndInit(_sherpaOfflineVoice);
-    }
+    await _ensureSherpaInfrastructure();
 
     if (!mounted) return;
     setState(() {
       _isPlaying = true;
+      _paused = false;
       _clearHighlight();
     });
     await _run();
+  }
+
+  Future<void> _pauseFlutterTtsForReadAloud() async {
+    if (kIsWeb) return;
+    try {
+      await _tts.pause();
+    } catch (_) {}
+  }
+
+  /// Motor do sistema: `pause()` pode fazer `speak` terminar antes do fim — repetimos o mesmo texto ao retomar.
+  Future<void> _speakNormalizedChunkWithPauseResume(String normalizedText) async {
+    var attempts = 0;
+    while (mounted && _isPlaying && attempts < 16) {
+      attempts++;
+      var utteranceNaturallyCompleted = false;
+      _tts.setCompletionHandler(() {
+        utteranceNaturallyCompleted = true;
+      });
+
+      try {
+        await _tts.speak(normalizedText);
+      } finally {
+        _tts.setCompletionHandler(() {});
+      }
+
+      if (!mounted || !_isPlaying) return;
+
+      await Future<void>.delayed(const Duration(milliseconds: 28));
+
+      final completed = utteranceNaturallyCompleted;
+
+      if (_paused) {
+        _resumeCompleter = Completer<void>();
+        await _resumeCompleter!.future;
+        _resumeCompleter = null;
+        if (!mounted || !_isPlaying) return;
+        if (completed) return;
+        continue;
+      }
+
+      if (completed) return;
+
+      if (!_isPlaying) return;
+    }
   }
 
   Future<void> _run() async {
@@ -537,34 +792,16 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       while (mounted && _isPlaying && _chunkIndex < _queue.length) {
         final g0 = _readingPrefetchGeneration;
         final c = _queue[_chunkIndex];
-        if (c.page != _currentPage) {
-          setState(() => _currentPage = c.page);
-          _persistPage();
-          final cached = _pageTextFromQueue[c.page];
-          if (cached != null) {
-            setState(() {
-              if (cached.isEmpty) {
-                _pageText =
-                    '(Sem texto selecionável nesta página.)';
-                _pagePlain = '';
-              } else {
-                _pageText = cached;
-                _pagePlain = cached;
-              }
-              _clearHighlight();
-            });
-          } else {
-            await _loadPageText(_currentPage);
-          }
-        }
         if (!mounted || !_isPlaying) break;
 
         if (mounted) {
           setState(() {
-            _hlStart = c.offsetInPage;
-            _hlEnd = c.offsetInPage + c.text.length;
+            _applyReadHighlightChunkProgress(c, 0);
+            _flutterWordProgress = 0;
           });
-          _scrollHighlightIntoView();
+          if (_pdfController.isReady) {
+            _pdfController.invalidate();
+          }
         }
 
         try {
@@ -592,6 +829,15 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
             if (wavPath == null) {
               if (!mounted || !_isPlaying) break;
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Não foi possível gerar áudio. Tente de novo ou use a voz do telemóvel.',
+                    ),
+                  ),
+                );
+              }
               break;
             }
 
@@ -612,12 +858,13 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
             await TtsService.instance.playPreparedWav(
               wavPath,
               volume: _playbackVolume,
+              playbackSpeed: _wavPlaybackSpeed,
               mediaTitle: _mediaChunkTitle(c.text, c.page),
               mediaAlbum: widget.item.displayName,
               mediaArtUri: _coverArtUri(),
             );
           } else {
-            await _tts.speak(c.text);
+            await _speakNormalizedChunkWithPauseResume(_normalizeTtsText(c.text));
           }
         } catch (e) {
           if (mounted) setState(() => _isGenerating = false);
@@ -653,6 +900,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
           continue;
         }
 
+        widget.onPagePersist?.call(c.page - 1, totalPages: _totalPages);
         _chunkIndex++;
       }
 
@@ -677,16 +925,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   // ─── Tap-to-jump ───
 
-  void _handleTextTap(TapUpDetails details) {
-    final ro = _textKey.currentContext?.findRenderObject();
-    if (ro is! RenderParagraph) return;
-    final local = ro.globalToLocal(details.globalPosition);
-    final pos = ro.getPositionForOffset(local);
-    _jumpToCharOffset(pos.offset);
-  }
-
-  void _jumpToCharOffset(int charOffset) {
-    if (_pagePlain.isEmpty) return;
+  Future<void> _jumpToCharOffset(int charOffset) async {
+    if (_pageTextFromQueue[_currentPage] == null) {
+      await _fillQueue(fromPage: _currentPage);
+    }
+    final pageFull = _pageTextFromQueue[_currentPage];
+    if (pageFull == null || pageFull.isEmpty) return;
 
     // Se a fila já tem chunks da página atual, procurar o chunk certo
     int? targetChunk;
@@ -724,12 +968,11 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     }
     if (!mounted) return;
 
-    if (isSherpaOffline) {
-      await TtsService.instance.ensureBundlesAndInit(_sherpaOfflineVoice);
-    }
+    await _ensureSherpaInfrastructure();
 
     setState(() {
       _isPlaying = true;
+      _paused = false;
       _clearHighlight();
     });
     await _run();
@@ -738,11 +981,16 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   // ─── Playback controls ───
 
   void _stopPlayback() {
+    _completeResumeWaitIfAny();
+    _paused = false;
     _bumpReadingPrefetchGen();
     _clearSherpaPrefetchFutures();
     _isPlaying = false;
     _pendingBackChunk = false;
     _pendingJumpChunk = null;
+    _wavScrubbingSherpa = false;
+    _wavChunkPos = null;
+    _wavChunkDur = null;
     if (isSherpaOffline) {
       unawaited(TtsService.instance.stop());
     } else {
@@ -762,9 +1010,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _queue.clear();
     _pageTextFromQueue.clear();
     _chunkIndex = 0;
-    setState(() => _currentPage--);
+    final page = _currentPage - 1;
+    setState(() => _currentPage = page);
     _persistPage();
-    unawaited(_loadPageText(_currentPage));
+    if (_pdfController.isReady) {
+      unawaited(_pdfController.goToPage(pageNumber: page));
+    }
   }
 
   void _onNextPage() {
@@ -773,26 +1024,32 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _queue.clear();
     _pageTextFromQueue.clear();
     _chunkIndex = 0;
-    setState(() => _currentPage++);
+    final page = _currentPage + 1;
+    setState(() => _currentPage = page);
     _persistPage();
-    unawaited(_loadPageText(_currentPage));
+    if (_pdfController.isReady) {
+      unawaited(_pdfController.goToPage(pageNumber: page));
+    }
   }
 
   void _onTogglePlayPause() {
-    if (_isPlaying) {
-      _bumpReadingPrefetchGen();
-      _clearSherpaPrefetchFutures();
-      _isPlaying = false;
-      _pendingBackChunk = false;
-      _pendingJumpChunk = null;
-      if (isSherpaOffline) {
-        unawaited(TtsService.instance.stop());
-      } else {
-        unawaited(_tts.stop());
-      }
-      if (mounted) setState(() => _isGenerating = false);
-    } else {
+    if (!_isPlaying) {
       unawaited(_play());
+      return;
+    }
+    if (_paused) {
+      setState(() => _paused = false);
+      if (isSherpaOffline) {
+        unawaited(TtsService.instance.resumeReadingPlayback());
+      }
+      _completeResumeWaitIfAny();
+      return;
+    }
+    setState(() => _paused = true);
+    if (isSherpaOffline) {
+      unawaited(TtsService.instance.pauseReadingPlayback());
+    } else {
+      unawaited(_pauseFlutterTtsForReadAloud());
     }
   }
 
@@ -844,356 +1101,690 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     );
   }
 
-  // ─── Build text widget com highlight + tap ───
+  Duration _estimatedFlutterChunkDuration(_Chunk chunk) {
+    final n = max(1, chunk.text.length);
+    final rateFactor = (_speechRate / 0.45).clamp(0.48, 3.9);
+    const baseCharsPerSec = 12.0;
+    final secs =
+        ((n / (baseCharsPerSec * rateFactor)).ceil()).clamp(3, 36000);
+    return Duration(seconds: secs);
+  }
 
-  Widget _buildReadingText() {
-    const baseStyle = TextStyle(color: AppTheme.ink, height: 1.5, fontSize: 16);
-    const hiStyle = TextStyle(
-      color: _highlightFg,
-      height: 1.5,
-      fontSize: 16,
-      backgroundColor: _highlightBg,
-      fontWeight: FontWeight.w600,
+  String _formatShortDuration(Duration d) {
+    final totalMs = max(0, d.inMilliseconds);
+    final totalSec = (totalMs + 500) ~/ 1000;
+    final m = totalSec ~/ 60;
+    final rs = totalSec % 60;
+    return '$m:${rs.toString().padLeft(2, '0')}';
+  }
+
+  Widget _buildSpeechAndWavSpeedSliders(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final labelStyle = Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: cs.onSurfaceVariant,
+          fontWeight: FontWeight.w500,
+        );
+    final sliders = <Widget>[];
+    if (!isSherpaOffline) {
+      sliders.add(Text('Velocidade — voz do telemóvel', style: labelStyle));
+      sliders.add(
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 2.8,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+          ),
+          child: Slider(
+            min: 0.22,
+            max: 0.92,
+            value: _speechRate.clamp(0.22, 0.92),
+            activeColor: cs.primary,
+            onChanged: (v) async {
+              final nv = v.clamp(0.22, 0.92);
+              setState(() => _speechRate = nv);
+              await _tts.setSpeechRate(nv);
+              await _persistSpeechSpeeds();
+            },
+          ),
+        ),
+      );
+    }
+    if (isSherpaOffline && !kIsWeb) {
+      sliders.add(Text('Velocidade — WAV (Vault offline)', style: labelStyle));
+      sliders.add(
+        SliderTheme(
+          data: SliderTheme.of(context).copyWith(
+            trackHeight: 2.8,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+          ),
+          child: Slider(
+            min: 0.65,
+            max: 1.75,
+            value: _wavPlaybackSpeed.clamp(0.65, 1.75),
+            activeColor: cs.primary,
+            onChanged: (v) async {
+              final nv = v.clamp(0.65, 1.75);
+              setState(() => _wavPlaybackSpeed = nv);
+              await _persistSpeechSpeeds();
+              if (VaultReadingAudio.isReady) {
+                await VaultReadingAudio.handler?.setPlaybackSpeed(nv);
+              }
+            },
+          ),
+        ),
+      );
+    }
+    if (sliders.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 2, bottom: 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: sliders,
+      ),
     );
-    final full = _pagePlain;
-    if (full.isEmpty) {
-      return Text(_pageText, style: baseStyle);
+  }
+
+  Widget _buildPlayingProgressStrip(BuildContext context) {
+    if (!_viewerReady ||
+        !_isPlaying ||
+        _queue.isEmpty ||
+        _chunkIndex >= _queue.length) {
+      return const SizedBox.shrink();
+    }
+    final chunk = _queue[_chunkIndex];
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+
+    if (!isSherpaOffline) {
+      final est = _estimatedFlutterChunkDuration(chunk);
+      final estMs = est.inMilliseconds.clamp(1, 1 << 30);
+      final elapsedMs =
+          ((_flutterWordProgress * estMs).round()).clamp(0, estMs);
+      final elapsed = Duration(milliseconds: elapsedMs);
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Trecho (aprox.) · pág. ${chunk.page}',
+            style:
+                Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Para avançar/retroceder com precisão, use Vault offline '
+            '(a voz do sistema não permite arrastar esta barra aqui).',
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: muted.withValues(alpha: 0.85),
+                  fontSize: 10.5,
+                  height: 1.25,
+                ),
+          ),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Text(
+                _formatShortDuration(elapsed),
+                style:
+                    Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3,
+                    thumbShape: const RoundSliderThumbShape(
+                      enabledThumbRadius: 9,
+                    ),
+                  ),
+                  child: Slider(
+                    value: _flutterWordProgress.clamp(0.0, 1.0),
+                    onChanged: null,
+                  ),
+                ),
+              ),
+              Text(
+                _formatShortDuration(est),
+                style:
+                    Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
+              ),
+            ],
+          ),
+        ],
+      );
     }
 
-    final hs = _hlStart;
-    final he = _hlEnd;
-
-    final hasHighlight =
-        hs != null && he != null && _isPlaying && hs < he && he <= full.length;
-
-    List<InlineSpan> spans;
-    if (hasHighlight) {
-      final a = hs.clamp(0, full.length);
-      final b = he.clamp(0, full.length);
-      spans = [
-        if (a > 0) TextSpan(text: full.substring(0, a), style: baseStyle),
-        TextSpan(text: full.substring(a, b), style: hiStyle),
-        if (b < full.length)
-          TextSpan(text: full.substring(b), style: baseStyle),
-      ];
-    } else {
-      spans = [TextSpan(text: full, style: baseStyle)];
+    if (!VaultReadingAudio.isReady) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 2),
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'A iniciar serviço de leitura em segundo plano…',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: muted,
+                    ),
+              ),
+            ),
+          ],
+        ),
+      );
     }
 
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-      onTapUp: _handleTextTap,
-      child: RichText(
-        key: _textKey,
-        text: TextSpan(children: spans),
-        softWrap: true,
+    final dmRaw = (_wavChunkDur ?? Duration.zero).inMilliseconds;
+    double fracLive = 0;
+    if (dmRaw > 0) {
+      final pmRaw = (_wavChunkPos ?? Duration.zero).inMilliseconds;
+      fracLive = (pmRaw / dmRaw.toDouble()).clamp(0.0, 1.0);
+    }
+    final frac =
+        (_wavScrubbingSherpa ? _wavScrubFraction : fracLive).clamp(0.0, 1.0);
+    final elapsed =
+        Duration(milliseconds: dmRaw <= 0 ? 0 : (frac * dmRaw).round());
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Trecho · pág. ${chunk.page}',
+          style:
+              Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
+        ),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Text(
+              dmRaw <= 0 ? '—' : _formatShortDuration(elapsed),
+              style:
+                  Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
+            ),
+            Expanded(
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 3,
+                  thumbShape:
+                      const RoundSliderThumbShape(enabledThumbRadius: 9),
+                ),
+                child: Slider(
+                  value: frac,
+                  onChangeStart:
+                      dmRaw <= 0
+                          ? null
+                          : (_) {
+                            setState(() {
+                              _wavScrubbingSherpa = true;
+                              _wavScrubFraction =
+                                  ((_wavChunkPos ?? Duration.zero)
+                                              .inMilliseconds /
+                                          dmRaw)
+                                      .clamp(0.0, 1.0);
+                              if (_chunkIndex < _queue.length) {
+                                _applyReadHighlightChunkProgress(
+                                  _queue[_chunkIndex],
+                                  _wavScrubFraction,
+                                );
+                              }
+                            });
+                          },
+                  onChanged:
+                      dmRaw <= 0
+                          ? null
+                          : (v) => setState(() {
+                            _wavScrubFraction = v.clamp(0.0, 1.0);
+                            if (_chunkIndex < _queue.length) {
+                              _applyReadHighlightChunkProgress(
+                                _queue[_chunkIndex],
+                                _wavScrubFraction,
+                              );
+                            }
+                          }),
+                  onChangeEnd:
+                      dmRaw <= 0
+                          ? (_) {
+                            setState(() => _wavScrubbingSherpa = false);
+                          }
+                          : (_) async {
+                            final ms =
+                                ((_wavScrubFraction * dmRaw).round()).clamp(
+                              0,
+                              dmRaw,
+                            );
+                            await VaultReadingAudio.handler?.seek(
+                              Duration(milliseconds: ms),
+                            );
+                            if (mounted) {
+                              setState(() {
+                                _wavScrubbingSherpa = false;
+                              });
+                            }
+                          },
+                ),
+              ),
+            ),
+            Text(
+              dmRaw <= 0
+                  ? '—'
+                  : _formatShortDuration(Duration(milliseconds: dmRaw)),
+              style:
+                  Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPlaybackBar(BuildContext context) {
+    final tp = _totalPages;
+    final cs = Theme.of(context).colorScheme;
+    return ClipRRect(
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              cs.surfaceContainerHighest.withValues(alpha: 0.98),
+              cs.surface.withValues(alpha: 1),
+            ],
+          ),
+          border: Border(
+            top: BorderSide(color: cs.outline.withValues(alpha: 0.38)),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.55),
+              blurRadius: 28,
+              offset: const Offset(0, -10),
+            ),
+          ],
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.volume_down_rounded,
+                      color: cs.primary.withValues(alpha: 0.75),
+                      size: 22,
+                    ),
+                    Expanded(
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 4,
+                          thumbShape: const RoundSliderThumbShape(
+                            enabledThumbRadius: 9,
+                          ),
+                          overlayShape: const RoundSliderOverlayShape(
+                            overlayRadius: 18,
+                          ),
+                        ),
+                        child: Slider(
+                          value: _playbackVolume.clamp(0.0, 1.0),
+                          activeColor: cs.primary,
+                          onChanged: (v) async {
+                            setState(() => _playbackVolume = v);
+                            await _applyPlaybackVolumeToEngines();
+                            await _persistPlaybackVolume();
+                          },
+                        ),
+                      ),
+                    ),
+                    Icon(
+                      Icons.volume_up_rounded,
+                      color: cs.primary.withValues(alpha: 0.75),
+                      size: 22,
+                    ),
+                  ],
+                ),
+                if (_viewerReady && _loadError == null) ...[
+                  const SizedBox(height: 10),
+                  _buildSpeechAndWavSpeedSliders(context),
+                  _buildPlayingProgressStrip(context),
+                ],
+                const SizedBox(height: 10),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _PlaybackCircleButton(
+                        kind: _PlaybackBtnKind.navPage,
+                        icon: Icons.chevron_left_rounded,
+                        tooltip: 'Página anterior',
+                        onPressed: _currentPage > 1 ? _onPrevPage : null,
+                      ),
+                      const SizedBox(width: 8),
+                      _PlaybackCircleButton(
+                        kind: _PlaybackBtnKind.segmentSkip,
+                        icon: Icons.fast_rewind_rounded,
+                        tooltip: 'Trecho anterior',
+                        onPressed:
+                            _isPlaying && _chunkIndex > 0
+                                ? _seekPreviousSegment
+                                : null,
+                      ),
+                      const SizedBox(width: 12),
+                      _PlaybackCircleButton(
+                        kind: _PlaybackBtnKind.playPrimary,
+                        icon: _isPlaying && !_paused
+                            ? Icons.pause_rounded
+                            : Icons.play_arrow_rounded,
+                        tooltip: !_isPlaying
+                            ? 'Começar leitura'
+                            : (_paused
+                                ? 'Continuar leitura'
+                                : 'Pausar leitura'),
+                        onPressed: _onTogglePlayPause,
+                      ),
+                      const SizedBox(width: 12),
+                      _PlaybackCircleButton(
+                        kind: _PlaybackBtnKind.stop,
+                        icon: Icons.stop_rounded,
+                        tooltip: 'Parar',
+                        onPressed: _isPlaying ? _stopPlayback : null,
+                      ),
+                      const SizedBox(width: 8),
+                      _PlaybackCircleButton(
+                        kind: _PlaybackBtnKind.segmentSkip,
+                        icon: Icons.fast_forward_rounded,
+                        tooltip: 'Trecho seguinte',
+                        onPressed: _isPlaying ? _seekNextSegment : null,
+                      ),
+                      const SizedBox(width: 8),
+                      _PlaybackCircleButton(
+                        kind: _PlaybackBtnKind.navPage,
+                        icon: Icons.chevron_right_rounded,
+                        tooltip: 'Página seguinte',
+                        onPressed: tp != null && _currentPage < tp
+                            ? _onNextPage
+                            : null,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
 
   @override
   void dispose() {
+    _paused = false;
+    _completeResumeWaitIfAny();
     _bumpReadingPrefetchGen();
     _vaultAudioStopSub?.cancel();
+    _vaultSegmentSkipSub?.cancel();
+    _wavProgressSub?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    _persistPage();
+    _persistLibraryBookmarkOnExit();
+    _structuredByPage.clear();
+    _pageTextFromQueue.clear();
     if (isSherpaOffline) {
       unawaited(TtsService.instance.stop());
     } else {
       unawaited(_tts.stop());
     }
-    unawaited(_doc?.dispose() ?? Future.value());
-    _scrollController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final t = _totalPages;
+    final initialPage =
+        (widget.item.lastPageIndex + 1).clamp(1, 1 << 20);
+    final surface = Theme.of(context).scaffoldBackgroundColor;
+
     return PopScope(
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) _stopPlayback();
       },
       child: Scaffold(
-        backgroundColor: AppTheme.black,
+        backgroundColor: surface,
         appBar: AppBar(
-          backgroundColor: AppTheme.black,
+          backgroundColor: surface,
           surfaceTintColor: Colors.transparent,
-          title: Text(
-            widget.item.displayName,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                widget.item.displayName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              Text(
+                _subtitleForPdfAppBar(t),
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w400,
+                    ),
+              ),
+            ],
           ),
           actions: [
-            if (!_loadingDoc && _loadError == null) ...[
-              TextButton(onPressed: _openVoiceSheet, child: const Text('Voz')),
-            ],
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'Págs.',
-                  style: TextStyle(color: AppTheme.muted, fontSize: 12),
-                ),
-                Switch(
-                  value: _autoContinue,
-                  onChanged: (v) => setState(() => _autoContinue = v),
-                ),
-              ],
-            ),
-            const SizedBox(width: 4),
-          ],
-        ),
-        body: _loadingDoc
-            ? const Center(
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: AppTheme.ink,
-                ),
-              )
-            : _loadError != null
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(
-                        'Erro: $_loadError',
-                        style:
-                            const TextStyle(color: AppTheme.ink, height: 1.4),
-                        textAlign: TextAlign.center,
+            if (_viewerReady && _loadError == null) ...[
+              if (_isPlaying) ...[
+                if (_isGenerating) ...[
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Theme.of(context).colorScheme.primary,
                       ),
                     ),
-                  )
-                : Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                  ),
+                ] else
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: Icon(
+                      Icons.graphic_eq_rounded,
+                      size: 22,
+                      color: Theme.of(context).colorScheme.primary
+                          .withValues(alpha: 0.92),
+                    ),
+                  ),
+              ],
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: FilledButton.tonalIcon(
+                  onPressed: _openVoiceSheet,
+                  icon: const Icon(Icons.record_voice_over_rounded, size: 20),
+                  label: const Text('Voz'),
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Theme.of(context)
+                      .colorScheme
+                      .surfaceContainerHighest
+                      .withValues(alpha: 0.82),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .outline
+                        .withValues(alpha: 0.35),
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.only(left: 10),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                        child: Row(
-                          children: [
-                            if (t != null)
-                              Text(
-                                'Página $_currentPage de $t',
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .labelSmall
-                                    ?.copyWith(color: AppTheme.muted),
-                              ),
-                            const Spacer(),
-                            if (_isPlaying) ...[
-                              if (_isGenerating) ...[
-                                const SizedBox(
-                                  width: 12,
-                                  height: 12,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 1.5,
-                                    color: AppTheme.muted,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  'A gerar…',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .labelSmall
-                                      ?.copyWith(color: AppTheme.muted),
-                                ),
-                              ] else ...[
-                                const Icon(
-                                  Icons.graphic_eq_rounded,
-                                  size: 16,
-                                  color: AppTheme.muted,
-                                ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  'A ler',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .labelSmall
-                                      ?.copyWith(color: AppTheme.ink),
-                                ),
-                              ],
-                            ],
-                          ],
-                        ),
+                      Text(
+                        'Seguir págs.',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
+                              fontWeight: FontWeight.w600,
+                            ),
                       ),
-                      // Slider de páginas
-                      if (t != null && t > 1)
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              trackHeight: 2,
-                              thumbShape: const RoundSliderThumbShape(
-                                enabledThumbRadius: 6,
-                              ),
-                              overlayShape: const RoundSliderOverlayShape(
-                                overlayRadius: 14,
-                              ),
-                            ),
-                            child: Slider(
-                              value: _currentPage.toDouble(),
-                              min: 1,
-                              max: t.toDouble(),
-                              divisions: t > 1 ? t - 1 : null,
-                              activeColor: _readAloudBlue,
-                              label: '$_currentPage',
-                              onChanged: (v) {
-                                final page = v.round();
-                                if (page == _currentPage) return;
-                                _stopPlayback();
-                                _queue.clear();
-                                _pageTextFromQueue.clear();
-                                _chunkIndex = 0;
-                                setState(() => _currentPage = page);
-                                _persistPage();
-                                unawaited(_loadPageText(page));
-                              },
-                            ),
-                          ),
-                        ),
-                      // Dica de toque
-                      if (!_isPlaying && _pagePlain.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 20),
-                          child: Text(
-                            'Toca no texto para começar a ler a partir daí',
-                            style: TextStyle(
-                              color: AppTheme.muted.withValues(alpha: 0.6),
-                              fontSize: 11,
-                              fontStyle: FontStyle.italic,
-                            ),
-                          ),
-                        ),
-                      Expanded(
-                        child: SingleChildScrollView(
-                          controller: _scrollController,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 20,
-                            vertical: 4,
-                          ),
-                          child: _buildReadingText(),
-                        ),
-                      ),
-                      SafeArea(
-                        top: false,
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Row(
-                                children: [
-                                  const Icon(
-                                    Icons.volume_down_rounded,
-                                    color: AppTheme.muted,
-                                    size: 22,
-                                  ),
-                                  Expanded(
-                                    child: SliderTheme(
-                                      data: SliderTheme.of(context).copyWith(
-                                        trackHeight: 3,
-                                        thumbShape:
-                                            const RoundSliderThumbShape(
-                                              enabledThumbRadius: 8,
-                                            ),
-                                      ),
-                                      child: Slider(
-                                        value: _playbackVolume.clamp(0.0, 1.0),
-                                        activeColor: _readAloudBlue,
-                                        onChanged: (v) async {
-                                          setState(() => _playbackVolume = v);
-                                          await _applyPlaybackVolumeToEngines();
-                                          await _persistPlaybackVolume();
-                                        },
-                                      ),
-                                    ),
-                                  ),
-                                  const Icon(
-                                    Icons.volume_up_rounded,
-                                    color: AppTheme.muted,
-                                    size: 22,
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              FittedBox(
-                                fit: BoxFit.scaleDown,
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Tooltip(
-                                      message: 'Página anterior',
-                                      child: _RoundIconButton(
-                                        color: AppTheme.black,
-                                        borderColor: AppTheme.ink,
-                                        onPressed: _currentPage > 1
-                                            ? _onPrevPage
-                                            : null,
-                                        icon: Icons.chevron_left_rounded,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Tooltip(
-                                      message: 'Trecho anterior',
-                                      child: _RoundIconButton(
-                                        color: AppTheme.black,
-                                        borderColor: AppTheme.muted,
-                                        onPressed: _isPlaying &&
-                                                _chunkIndex > 0
-                                            ? _seekPreviousSegment
-                                            : null,
-                                        icon: Icons.fast_rewind_rounded,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    _RoundIconButton(
-                                      color: _readAloudBlue,
-                                      onPressed: _onTogglePlayPause,
-                                      icon: _isPlaying
-                                          ? Icons.pause_rounded
-                                          : Icons.play_arrow_rounded,
-                                    ),
-                                    const SizedBox(width: 6),
-                                    _RoundIconButton(
-                                      color: AppTheme.ink,
-                                      onPressed:
-                                          _isPlaying ? _stopPlayback : null,
-                                      icon: Icons.stop_rounded,
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Tooltip(
-                                      message: 'Próximo trecho',
-                                      child: _RoundIconButton(
-                                        color: AppTheme.black,
-                                        borderColor: AppTheme.muted,
-                                        onPressed:
-                                            _isPlaying ? _seekNextSegment : null,
-                                        icon: Icons.fast_forward_rounded,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Tooltip(
-                                      message: 'Página seguinte',
-                                      child: _RoundIconButton(
-                                        color: AppTheme.black,
-                                        borderColor: AppTheme.ink,
-                                        onPressed:
-                                            t != null && _currentPage < t
-                                                ? _onNextPage
-                                                : null,
-                                        icon: Icons.chevron_right_rounded,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                      Switch(
+                        materialTapTargetSize:
+                            MaterialTapTargetSize.shrinkWrap,
+                        value: _autoContinue,
+                        onChanged: (v) =>
+                            setState(() => _autoContinue = v),
                       ),
                     ],
                   ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        body: _loadError != null
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    'Erro: $_loadError',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              )
+            : Stack(
+                fit: StackFit.expand,
+                children: [
+                  PdfViewer.file(
+                    widget.item.filePath,
+                    controller: _pdfController,
+                    initialPageNumber: initialPage,
+                    params: PdfViewerParams(
+                      backgroundColor: Colors.black,
+                      pagePaintCallbacks: [_paintReadAloudHighlight],
+                      onGeneralTap: _onPdfTap,
+                      onDocumentChanged: (doc) {
+                        if (doc == null) return;
+                        final count = doc.pages.length;
+                        setState(() {
+                          _viewerReady = true;
+                          _totalPages = count;
+                          _currentPage = _currentPage.clamp(1, count);
+                        });
+                        _persistPage();
+                      },
+                      onPageChanged: (n) {
+                        if (n == null || n == _currentPage) return;
+                        final wasPlaying = _isPlaying;
+                        if (!wasPlaying) {
+                          _queue.clear();
+                          _pageTextFromQueue.clear();
+                          _chunkIndex = 0;
+                        }
+                        setState(() => _currentPage = n);
+                        if (!wasPlaying) {
+                          _persistPage();
+                        }
+                      },
+                    ),
+                  ),
+                  if (!_viewerReady)
+                    const Center(
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  if (_viewerReady && !_isPlaying)
+                    Positioned(
+                      left: 16,
+                      right: 16,
+                      top: 10,
+                      child: IgnorePointer(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(14),
+                            gradient: LinearGradient(
+                              colors: [
+                                Colors.black.withValues(alpha: 0.72),
+                                Colors.black.withValues(alpha: 0.52),
+                              ],
+                            ),
+                            border: Border.all(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .primary
+                                  .withValues(alpha: 0.35),
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.35),
+                                blurRadius: 18,
+                                offset: const Offset(0, 6),
+                              ),
+                            ],
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 11,
+                            ),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.touch_app_rounded,
+                                  size: 18,
+                                  color: Theme.of(context).colorScheme.primary,
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    'Toca no texto do PDF para ouvir a partir daí',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelMedium
+                                        ?.copyWith(
+                                          color: Colors.white.withValues(
+                                            alpha: 0.94,
+                                          ),
+                                          height: 1.25,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: _buildPlaybackBar(context),
+                  ),
+                ],
+              ),
       ),
     );
   }
@@ -1281,7 +1872,7 @@ class _ReadAloudVoiceModalContentState
       selected: selected,
       title: Text(title),
       trailing: selected
-          ? Icon(Icons.check_rounded, color: _readAloudBlue, size: 20)
+          ? Icon(Icons.check_rounded, color: Theme.of(context).colorScheme.primary, size: 20)
           : null,
       onTap: () => _pickSherpa(id),
     );
@@ -1401,48 +1992,104 @@ class _ReadAloudVoiceModalContentState
   }
 }
 
-class _RoundIconButton extends StatelessWidget {
-  const _RoundIconButton({
-    required this.color,
-    required this.onPressed,
+enum _PlaybackBtnKind { navPage, segmentSkip, playPrimary, stop }
+
+class _PlaybackCircleButton extends StatelessWidget {
+  const _PlaybackCircleButton({
+    required this.kind,
     required this.icon,
-    this.borderColor,
+    required this.onPressed,
+    this.tooltip,
   });
 
-  final Color color;
-  final Color? borderColor;
-  final VoidCallback? onPressed;
+  final _PlaybackBtnKind kind;
   final IconData icon;
+  final VoidCallback? onPressed;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
-    final border = borderColor;
-    if (border != null) {
-      return Opacity(
-        opacity: onPressed == null ? 0.4 : 1,
-        child: Material(
-          color: color,
-          shape: CircleBorder(side: BorderSide(color: border, width: 1.2)),
-          clipBehavior: Clip.antiAlias,
-          child: IconButton(
-            onPressed: onPressed,
-            icon: Icon(icon, color: border, size: 28),
+    final cs = Theme.of(context).colorScheme;
+    final disabled = onPressed == null;
+
+    var size = 46.0;
+    var iconSize = 23.0;
+    Gradient? gradient;
+    Color bg = cs.surfaceContainerHighest;
+    Color borderCol = cs.outline.withValues(alpha: 0.42);
+    Color iconColor = cs.onSurface;
+    List<BoxShadow>? shadows;
+
+    switch (kind) {
+      case _PlaybackBtnKind.navPage:
+        bg = cs.surfaceContainerHigh;
+        iconColor = cs.onSurface.withValues(alpha: 0.95);
+        iconSize = 24;
+        break;
+      case _PlaybackBtnKind.segmentSkip:
+        bg = cs.surfaceContainerHighest.withValues(alpha: 0.88);
+        iconColor = cs.primary.withValues(alpha: 0.95);
+        borderCol = cs.primary.withValues(alpha: 0.38);
+        break;
+      case _PlaybackBtnKind.playPrimary:
+        size = 58;
+        iconSize = 31;
+        gradient = LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            cs.primary,
+            cs.tertiary.withValues(alpha: 0.92),
+          ],
+        );
+        iconColor = cs.onPrimary;
+        borderCol = Colors.transparent;
+        shadows = [
+          BoxShadow(
+            color: cs.primary.withValues(alpha: 0.48),
+            blurRadius: 20,
+            offset: const Offset(0, 9),
           ),
-        ),
-      );
+        ];
+        break;
+      case _PlaybackBtnKind.stop:
+        bg = cs.error.withValues(alpha: 0.14);
+        iconColor = cs.error;
+        borderCol = cs.error.withValues(alpha: 0.42);
+        break;
     }
-    return Opacity(
-      opacity: onPressed == null ? 0.4 : 1,
+
+    final circle = Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: gradient,
+        color: gradient == null ? bg : null,
+        border: Border.all(
+          color: borderCol,
+          width: kind == _PlaybackBtnKind.playPrimary ? 0 : 1.25,
+        ),
+        boxShadow: shadows,
+      ),
       child: Material(
-        color: color,
-        shape: const CircleBorder(),
-        clipBehavior: Clip.antiAlias,
-        child: IconButton(
-          onPressed: onPressed,
-          color: Colors.white,
-          icon: Icon(icon, size: 32),
+        color: Colors.transparent,
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onPressed,
+          splashColor: cs.primary.withValues(alpha: 0.22),
+          highlightColor: cs.primary.withValues(alpha: 0.08),
+          child: Icon(icon, color: iconColor, size: iconSize),
         ),
       ),
     );
+
+    Widget child =
+        Opacity(opacity: disabled ? 0.38 : 1, child: circle);
+
+    if (tooltip != null && tooltip!.isNotEmpty) {
+      child = Tooltip(message: tooltip!, child: child);
+    }
+    return child;
   }
 }

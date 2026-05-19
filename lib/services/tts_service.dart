@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' show min;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -15,7 +16,7 @@ import 'vault_reading_audio.dart';
 /// Nova pasta quando os ficheiros em cache ficam estragados (ex.: cópias
 /// incompletas) — faz com que todos os ONNX/tokens/etc. voltem a ser escritos.
 /// Bump quando mudar formato da cache (ex.: normalização CRLF nos `.txt`).
-const String _ttsCacheDirName = 'vault_sherpa_tts_v5';
+const String _ttsCacheDirName = 'vault_sherpa_tts_v6';
 
 /// VITS/Piper offline via Sherpa-ONNX (`miro`, `dii`, `faber`).
 ///
@@ -49,7 +50,7 @@ class TtsService {
   String? get currentModel => _workerLoadedModel;
 
   Future<void> ensureBundlesAndInit(String modelName) async {
-    await _ensureBundlesCopied();
+    await _ensureBundlesCopied(modelName);
     await initTts(modelName);
   }
 
@@ -119,7 +120,7 @@ class TtsService {
         'modelName: usar miro, dii ou faber (recebido: $modelName)',
       );
     }
-    await _ensureBundlesCopied();
+    await _ensureBundlesCopied(normalized);
 
     final base = _cacheDir!;
     final onnxPath = p.join(base.path, '$normalized.onnx');
@@ -164,13 +165,12 @@ class TtsService {
       /* metadados opcionais */
     }
 
-    final threads = (!kIsWeb &&
-            (Platform.isAndroid ||
-                Platform.isIOS ||
-                Platform.isMacOS ||
-                Platform.isLinux))
-        ? 1
-        : 2;
+    /// Telemóveis fracos: 1 thread pode ser menos agressivo com CPU/memória.
+    /// Máximo 3 para desktops com muitos núcleos.
+    final cores = Platform.numberOfProcessors;
+    final threads = kIsWeb
+        ? 2
+        : min(3, cores <= 2 ? 1 : (cores <= 5 ? 2 : 3));
 
     _shutdownTtsWorker();
 
@@ -285,6 +285,7 @@ class TtsService {
   Future<void> playPreparedWav(
     String path, {
     double volume = -1,
+    double playbackSpeed = 1.0,
     String? mediaTitle,
     String? mediaAlbum,
     Uri? mediaArtUri,
@@ -303,6 +304,7 @@ class TtsService {
           title: mediaTitle ?? 'Leitura',
           album: mediaAlbum ?? 'Vault',
           volume: _outputVolume,
+          playbackSpeed: playbackSpeed,
           artUri: mediaArtUri,
         );
       } else {
@@ -383,20 +385,88 @@ class TtsService {
     await _stopPlaybackPipeline();
   }
 
-  Future<void> _ensureBundlesCopied() async {
-    if (_bundlesCopied != null) {
-      await _bundlesCopied!;
+  /// Pausa só o WAV/canal de leitura (não cancela síntese nem isolate).
+  Future<void> pauseReadingPlayback() async {
+    final h = VaultReadingAudio.handler;
+    if (VaultReadingAudio.isReady && h != null) {
+      await h.pause();
       return;
     }
-    _bundlesCopied = Future<void>(() async {
+    final pl = _fallbackPlayer;
+    if (pl != null) await pl.pause();
+  }
+
+  /// Retoma reprodução pausada por [pauseReadingPlayback].
+  Future<void> resumeReadingPlayback() async {
+    final h = VaultReadingAudio.handler;
+    if (VaultReadingAudio.isReady && h != null) {
+      await h.play();
+      return;
+    }
+    final pl = _fallbackPlayer;
+    if (pl != null) await pl.play();
+  }
+
+  /// Só copia espeak-ng-data + o modelo pedido (~60 MB em vez de ~180 MB).
+  bool _assetNeededForModel(String rel, String model) {
+    if (rel.startsWith('espeak-ng-data/')) return true;
+    return rel == '$model.onnx' ||
+        rel == '$model.onnx.json' ||
+        rel == 'tokens_$model.txt';
+  }
+
+  Future<void> _ensureBundlesCopied(String modelName) async {
+    final normalized = modelName.toLowerCase().trim();
+    if (_bundlesCopied != null) {
+      await _bundlesCopied!;
+    } else {
+      _bundlesCopied = _copySherpaAssetsOnce(normalized);
+      await _bundlesCopied!;
+    }
+    await _copySherpaModelIfMissing(normalized);
+  }
+
+  Future<void> _copySherpaModelIfMissing(String model) async {
+    final base = _cacheDir;
+    if (base == null) return;
+    final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
+    const prefix = 'assets/tts/';
+    for (final key in manifest.listAssets()) {
+      if (!key.startsWith(prefix)) continue;
+      final rel = key.substring(prefix.length);
+      if (!_assetNeededForModel(rel, model)) continue;
+      final dest = File(p.join(base.path, rel));
+      if (await dest.exists()) continue;
+      await _writeAssetToCache(key, rel, dest);
+    }
+  }
+
+  Future<void> _writeAssetToCache(String assetKey, String rel, File dest) async {
+    await dest.parent.create(recursive: true);
+    final bytes = await rootBundle.load(assetKey);
+    final raw = bytes.buffer.asUint8List();
+    if (rel.endsWith('.txt')) {
+      var s = utf8.decode(raw, allowMalformed: false);
+      if (s.startsWith('\uFEFF')) {
+        s = s.substring(1);
+      }
+      s = s.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+      await dest.writeAsString(s, flush: true);
+    } else {
+      await dest.writeAsBytes(raw);
+    }
+  }
+
+  Future<void> _copySherpaAssetsOnce(String initialModel) {
+    return Future<void>(() async {
       final doc = await getApplicationDocumentsDirectory();
 
-      /// Caches antigas — libertar espaço após migrações.
       for (final legacyName in [
         'vault_sherpa_tts',
         'vault_sherpa_tts_v2',
         'vault_sherpa_tts_v3',
         'vault_sherpa_tts_v4',
+        'vault_sherpa_tts_v5',
       ]) {
         try {
           final d = Directory(p.join(doc.path, legacyName));
@@ -412,29 +482,14 @@ class TtsService {
       final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
       const prefix = 'assets/tts/';
       for (final key in manifest.listAssets()) {
-        if (!key.startsWith(prefix)) {
-          continue;
-        }
+        if (!key.startsWith(prefix)) continue;
         final rel = key.substring(prefix.length);
+        if (!_assetNeededForModel(rel, initialModel)) continue;
         final dest = File(p.join(_cacheDir!.path, rel));
-        await dest.parent.create(recursive: true);
-        final bytes = await rootBundle.load(key);
-        final raw = bytes.buffer.asUint8List();
-        /// Sherpa `ReadTokens` falha com CRLF (`getline` deixa `\r` na linha),
-        /// produzindo exit nativo — normalizar texto antes de gravar.
-        if (rel.endsWith('.txt')) {
-          var s = utf8.decode(raw, allowMalformed: false);
-          if (s.startsWith('\uFEFF')) {
-            s = s.substring(1);
-          }
-          s = s.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
-          await dest.writeAsString(s, flush: true);
-        } else {
-          await dest.writeAsBytes(raw);
-        }
+        if (await dest.exists()) continue;
+        await _writeAssetToCache(key, rel, dest);
       }
     });
-    await _bundlesCopied!;
   }
 
   Future<void> _failIfMissingFile(String absolute, String hint) async {

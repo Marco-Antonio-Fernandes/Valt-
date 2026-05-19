@@ -522,6 +522,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
             floating: true,
             backgroundColor: AppTheme.black,
             surfaceTintColor: Colors.transparent,
+            flexibleSpace: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    c.surfaceContainerLow.withValues(alpha: 0.55),
+                    AppTheme.black,
+                  ],
+                ),
+              ),
+            ),
             title: const Text('As tuas sagas'),
             actions: [
               if (!kIsWeb && Platform.isAndroid)
@@ -565,15 +577,60 @@ class _LibraryScreenState extends State<LibraryScreen> {
               child: Padding(
                 padding: const EdgeInsets.all(28),
                 child: Center(
-                  child: Text(
-                    'Importa PDF, CBZ, CBR, CB7, CBT…\n'
-                    'Usa o botão de ficheiro para importar avulso,\n'
-                    'ou o botão de coleção para agrupar numa pasta.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: c.onSurfaceVariant,
-                      height: 1.4,
-                    ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: LinearGradient(
+                            colors: [
+                              c.primary.withValues(alpha: 0.22),
+                              c.tertiary.withValues(alpha: 0.12),
+                            ],
+                          ),
+                          border: Border.all(
+                            color: c.outline.withValues(alpha: 0.35),
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: c.primary.withValues(alpha: 0.18),
+                              blurRadius: 28,
+                              offset: const Offset(0, 10),
+                            ),
+                          ],
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.all(26),
+                          child: Icon(
+                            Icons.auto_stories_rounded,
+                            size: 48,
+                            color: c.primary.withValues(alpha: 0.95),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                      Text(
+                        'Começa por importar um livro',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: -0.2,
+                            ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        'Importa PDF, CBZ, CBR, CB7, CBT…\n'
+                        'Usa o ícone de ficheiro para avulsos,\n'
+                        'ou coleções para agrupar numa pasta.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: c.onSurfaceVariant,
+                          height: 1.45,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -659,7 +716,6 @@ class _SagaCard extends StatelessWidget {
   });
 
   static const _resumeGreen = Color(0xFF2E7D32);
-  static const _readAloudBlue = Color(0xFF1565C0);
 
   final Saga saga;
   final bool isPastaAlbum;
@@ -841,21 +897,41 @@ class _SagaCard extends StatelessWidget {
                             if (onReadAloud != null) ...[
                               Tooltip(
                                 message: 'Modo leitura (voz — só PDF)',
-                                child: Material(
-                                  color: _readAloudBlue,
-                                  elevation: 3,
-                                  shadowColor:
-                                      Colors.black.withValues(alpha: 0.45),
-                                  shape: const CircleBorder(),
-                                  clipBehavior: Clip.antiAlias,
-                                  child: InkWell(
-                                    onTap: onReadAloud,
-                                    child: const Padding(
-                                      padding: EdgeInsets.all(8),
-                                      child: Icon(
-                                        Icons.play_arrow_rounded,
-                                        color: Colors.white,
-                                        size: 30,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: LinearGradient(
+                                      colors: [
+                                        c.primary,
+                                        c.tertiary.withValues(alpha: 0.88),
+                                      ],
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                    ),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color:
+                                            c.primary.withValues(alpha: 0.42),
+                                        blurRadius: 14,
+                                        offset: const Offset(0, 7),
+                                      ),
+                                    ],
+                                  ),
+                                  child: Material(
+                                    color: Colors.transparent,
+                                    shape: const CircleBorder(),
+                                    clipBehavior: Clip.antiAlias,
+                                    child: InkWell(
+                                      onTap: onReadAloud,
+                                      splashColor:
+                                          Colors.white.withValues(alpha: 0.22),
+                                      child: const Padding(
+                                        padding: EdgeInsets.all(9),
+                                        child: Icon(
+                                          Icons.record_voice_over_rounded,
+                                          color: Colors.white,
+                                          size: 26,
+                                        ),
                                       ),
                                     ),
                                   ),

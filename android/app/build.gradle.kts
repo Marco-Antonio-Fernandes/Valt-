@@ -28,6 +28,12 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // armeabi-v7a faz o CMake do plugin `rar` compilar esse ABI; no Windows costuma falhar:
+        // "O arquivo já está sendo usado por outro processo". Telemóveis atuais são arm64.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {

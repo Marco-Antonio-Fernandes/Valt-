@@ -48,9 +48,80 @@ class AppTheme {
       brightness: Brightness.dark,
       colorScheme: cs,
       scaffoldBackgroundColor: black,
-      splashColor: cs.primary.withValues(alpha: 0.12),
-      highlightColor: cs.primary.withValues(alpha: 0.07),
+      splashColor: cs.primary.withValues(alpha: 0.14),
+      highlightColor: cs.primary.withValues(alpha: 0.08),
       textTheme: text,
+      dividerTheme: DividerThemeData(
+        color: cs.outline.withValues(alpha: 0.35),
+        thickness: 1,
+      ),
+      snackBarTheme: SnackBarThemeData(
+        behavior: SnackBarBehavior.floating,
+        elevation: 8,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        backgroundColor: cs.surfaceContainerHighest,
+        contentTextStyle: const TextStyle(color: ink, fontWeight: FontWeight.w500),
+      ),
+      dialogTheme: DialogThemeData(
+        backgroundColor: cs.surfaceContainerHigh,
+        elevation: 16,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      ),
+      bottomSheetTheme: BottomSheetThemeData(
+        backgroundColor: cs.surfaceContainerHigh,
+        modalBarrierColor: Colors.black.withValues(alpha: 0.65),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        dragHandleColor: cs.outlineVariant,
+        dragHandleSize: const Size(36, 4),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          elevation: 0,
+        ),
+      ),
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          elevation: 0,
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+      ),
+      segmentedButtonTheme: SegmentedButtonThemeData(
+        style: ButtonStyle(
+          visualDensity: VisualDensity.compact,
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        ),
+      ),
+      sliderTheme: SliderThemeData(
+        activeTrackColor: cs.primary,
+        inactiveTrackColor: cs.outline.withValues(alpha: 0.45),
+        thumbColor: cs.primary,
+        overlayColor: cs.primary.withValues(alpha: 0.14),
+        trackHeight: 3.5,
+      ),
+      switchTheme: SwitchThemeData(
+        trackOutlineColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) return Colors.transparent;
+          return cs.outline.withValues(alpha: 0.55);
+        }),
+      ),
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: {
+          TargetPlatform.android: FadeUpwardsPageTransitionsBuilder(),
+          TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
+          TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
+        },
+      ),
       appBarTheme: AppBarTheme(
         backgroundColor: black,
         foregroundColor: ink,
@@ -75,15 +146,34 @@ class AppTheme {
         color: cs.surfaceContainerHigh,
         elevation: 0,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(22),
+          side: BorderSide(color: cs.outline.withValues(alpha: 0.22)),
         ),
         margin: EdgeInsets.zero,
       ),
       iconButtonTheme: IconButtonThemeData(
         style: IconButton.styleFrom(
           foregroundColor: cs.onSurfaceVariant,
-          hoverColor: cs.primary.withValues(alpha: 0.1),
+          hoverColor: cs.primary.withValues(alpha: 0.12),
+          highlightColor: cs.primary.withValues(alpha: 0.08),
         ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: cs.surfaceContainerHighest,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: cs.outline.withValues(alpha: 0.45)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: cs.outline.withValues(alpha: 0.38)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide(color: cs.primary.withValues(alpha: 0.85), width: 1.6),
+        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       ),
     );
   }
