@@ -1,7 +1,6 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import '../app_theme.dart';
+import '../widgets/local_cover_image.dart';
 import '../models/library_item.dart';
 import '../models/saga.dart';
 import '../utils/comic_name_parser.dart';
@@ -290,14 +289,28 @@ class SagaDetailScreen extends StatelessWidget {
               : null;
           Widget? lead;
           final cp = it.coverPath;
-          if (cp != null && File(cp).existsSync()) {
+          if (cp != null && cp.isNotEmpty) {
             lead = ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.file(
-                File(cp),
+              child: SizedBox(
                 width: 48,
                 height: 64,
-                fit: BoxFit.cover,
+                child: localCoverImage(
+                  path: cp,
+                  fit: BoxFit.cover,
+                  fallback: SizedBox(
+                    width: 48,
+                    height: 64,
+                    child: ColoredBox(
+                      color: color.surfaceContainerHighest,
+                      child: Icon(
+                        Icons.menu_book_rounded,
+                        color: color.onSurfaceVariant,
+                        size: 22,
+                      ),
+                    ),
+                  ),
+                ),
               ),
             );
           }

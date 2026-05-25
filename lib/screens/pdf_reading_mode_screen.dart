@@ -5,7 +5,12 @@ import 'dart:math' show max, min;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform, kIsWeb;
+    show
+        TargetPlatform,
+        debugPrint,
+        debugPrintStack,
+        defaultTargetPlatform,
+        kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:pdfrx/pdfrx.dart';
@@ -14,7 +19,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_theme.dart';
 import '../models/library_item.dart';
-import '../services/tts_service.dart';
+import '../services/tts_service.dart' show TtsService;
 import '../services/vault_reading_audio.dart';
 
 const _kVoicePrefsKey = 'read_aloud_voice_json';
@@ -105,7 +110,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   var _isGenerating = false;
 
   var _readAloudEngine = 'system';
-  var _sherpaOfflineVoice = 'miro';
+  var _sherpaOfflineVoice = 'faber';
 
   bool get isSherpaOffline => _readAloudEngine == 'sherpa' && !kIsWeb;
   String get sherpaVoiceId => _sherpaOfflineVoice;
@@ -147,9 +152,13 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     if (kIsWeb && _readAloudEngine == 'sherpa') {
       _readAloudEngine = 'system';
     }
-    final sv =
-        (p.getString(_kSherpaOfflineVoice) ?? 'miro').toLowerCase().trim();
-    if (const {'miro', 'dii', 'faber'}.contains(sv)) {
+    var sv =
+        (p.getString(_kSherpaOfflineVoice) ?? 'faber').toLowerCase().trim();
+    if (sv == 'miro' || sv == 'dii' || sv == 'kokoro') {
+      sv = 'faber';
+      await p.setString(_kSherpaOfflineVoice, sv);
+    }
+    if (const {'faber', 'cadu'}.contains(sv)) {
       _sherpaOfflineVoice = sv;
     }
     _playbackVolume = (p.getDouble(_kReadAloudVolume) ?? 1.0).clamp(0.0, 1.0);
@@ -270,18 +279,26 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   Future<void> selectSherpaVoice(String id) async {
     final normalized = id.toLowerCase().trim();
-    if (!const {'miro', 'dii', 'faber'}.contains(normalized)) return;
+    if (!const {'faber', 'cadu'}.contains(normalized)) return;
 
     final wasPlaying = _isPlaying;
-    if (wasPlaying) _stopPlayback();
-
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kReadAloudEngine, 'sherpa');
-    await prefs.setString(_kSherpaOfflineVoice, normalized);
+    if (wasPlaying) {
+      _stopPlayback();
+      if (!kIsWeb && _readAloudEngine == 'sherpa') {
+        await TtsService.instance.stop();
+      }
+    }
 
     if (_sherpaOfflineVoice != normalized) {
       TtsService.instance.dispose();
     }
+
+    /// Falha antes de gravar prefs (ex.: ONNX em falta) — modal mostra [SnackBar].
+    await TtsService.instance.ensureBundlesAndInit(normalized);
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kReadAloudEngine, 'sherpa');
+    await prefs.setString(_kSherpaOfflineVoice, normalized);
 
     if (!mounted) return;
     setState(() {
@@ -727,7 +744,24 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       return;
     }
 
-    await _ensureSherpaInfrastructure();
+    try {
+      await _ensureSherpaInfrastructure();
+    } catch (e, st) {
+      debugPrint('Sherpa infra: $e');
+      debugPrintStack(stackTrace: st);
+      if (mounted) {
+        final msg =
+            e is StateError ? e.message : 'Offline TTS: $e';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 12),
+            content: Text(msg, maxLines: 8),
+          ),
+        );
+      }
+      return;
+    }
 
     if (!mounted) return;
     setState(() {
@@ -1821,7 +1855,19 @@ class _ReadAloudVoiceModalContentState
       await widget.host.selectSherpaVoice(id);
       if (!mounted) return;
       Navigator.of(context).pop();
-    } catch (_) {}
+    } catch (e, st) {
+      debugPrint('selectSherpaVoice: $e');
+      debugPrintStack(stackTrace: st);
+      if (!mounted) return;
+      final msg = e is StateError ? e.message : '${e.runtimeType}: $e';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 12),
+          content: Text(msg, maxLines: 8),
+        ),
+      );
+    }
   }
 
   Widget _offlineSection() {
@@ -1830,28 +1876,24 @@ class _ReadAloudVoiceModalContentState
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Text(
-          'Vault — offline PT-BR (Sherpa ONNX)',
+          'Vault — offline (Sherpa ONNX)',
           style: TextStyle(color: AppTheme.muted, fontSize: 12),
         ),
         const SizedBox(height: 8),
         _sherpaTile(
-          id: 'miro',
-          title: 'Miro — alta',
-          selected: h.isSherpaOffline && h.sherpaVoiceId == 'miro',
-        ),
-        _sherpaTile(
-          id: 'dii',
-          title: 'Dii — alta',
-          selected: h.isSherpaOffline && h.sherpaVoiceId == 'dii',
-        ),
-        _sherpaTile(
           id: 'faber',
-          title: 'Faber — média',
+          title: 'Faber — PT-BR (VITS/Piper)',
           selected: h.isSherpaOffline && h.sherpaVoiceId == 'faber',
+        ),
+        _sherpaTile(
+          id: 'cadu',
+          title: 'Cadu — Piper (PT-BR, offline)',
+          selected: h.isSherpaOffline && h.sherpaVoiceId == 'cadu',
         ),
         const SizedBox(height: 4),
         Text(
-          'Modelos e espeak-ng-data em assets/tts/.',
+          'Faber: assets/tts/Faber/. Cadu: assets/tts/cadu/ (+ tokens.txt ou tokens_cadu.txt). '
+          'Ambos partilham assets/tts/espeak-ng-data.',
           style: TextStyle(
             color: AppTheme.ink.withValues(alpha: 0.7),
             fontSize: 11,
@@ -1864,6 +1906,7 @@ class _ReadAloudVoiceModalContentState
   Widget _sherpaTile({
     required String id,
     required String title,
+    String? subtitle,
     required bool selected,
   }) {
     return ListTile(
@@ -1871,6 +1914,15 @@ class _ReadAloudVoiceModalContentState
       selectedColor: AppTheme.ink,
       selected: selected,
       title: Text(title),
+      subtitle: subtitle == null
+          ? null
+          : Text(
+              subtitle,
+              style: TextStyle(
+                fontSize: 11,
+                color: AppTheme.muted.withValues(alpha: 0.95),
+              ),
+            ),
       trailing: selected
           ? Icon(Icons.check_rounded, color: Theme.of(context).colorScheme.primary, size: 20)
           : null,

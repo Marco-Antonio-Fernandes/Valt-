@@ -1,5 +1,18 @@
 # Vault (hq_reader)
 
+## Backend (API no servidor)
+
+O backend FastAPI **não** fica dentro deste repositório. Está ao lado:
+
+- Pasta: **`Documents\Projetos\valt-catalog-api\`**
+- Código: apenas essa pasta (ou cópia no teu servidor 7).
+
+Na app Flutter, aponta o URL do API com `--dart-define=VAULT_BACKEND_URL=https://…`
+
+Instruções de arranque: `..\valt-catalog-api\README.md` (mesmo nível deste projeto na pasta Projetos).
+
+Se ainda vires **`Valt-\server`** no disco antigo é uma pasta vazia ou bloqueada; podes apagá‑la manualmente (fecha IDE/terminal que esteja a abrir essa pasta).
+
 ## Modo leitura (PDF + voz)
 
 O ecrã de leitura em voz mostra o **PDF completo** (como o leitor normal), com barra de controlo em baixo. Se ainda vires **só texto** num fundo escuro, o telemóvel está quase de certeza com um **APK antigo**.

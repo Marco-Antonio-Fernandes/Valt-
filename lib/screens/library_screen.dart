@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
@@ -12,10 +13,15 @@ import '../models/saga.dart';
 import '../services/import_service.dart';
 import '../services/library_store.dart';
 import '../services/vault_android_permissions.dart';
+import '../services/vault_auth_api.dart';
+import '../services/vault_auth_store.dart';
 import '../utils/comic_name_parser.dart';
+import '../widgets/local_cover_image.dart';
 import 'comic_reader_screen.dart';
 import 'pdf_reading_mode_screen.dart';
 import 'pdf_reader_screen.dart';
+import 'public_libraries_screen.dart';
+import 'account_screen.dart';
 import 'saga_detail_screen.dart';
 
 class LibraryScreen extends StatefulWidget {
@@ -30,6 +36,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
   final _import = ImportService();
   List<LibraryItem> _items = [];
   var _loading = true;
+  var _tabIndex = 0;
+  final _vaultAuthApi = VaultAuthApi();
+  final _vaultAuthStore = VaultAuthStore();
+
+  static bool get _isAndroidDevice =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  int get _boundedTabIndex =>
+      _tabIndex < 0 ? 0 : (_tabIndex > 3 ? 3 : _tabIndex);
+
+  @override
+  void dispose() {
+    _vaultAuthApi.close();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -492,6 +513,799 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _persist();
   }
 
+  LibraryItem? _latestReadIssueItem() {
+    LibraryItem? best;
+    DateTime? bestAt;
+    for (final it in _items) {
+      if (it.originalName == '.folder_placeholder' || it.filePath.isEmpty) {
+        continue;
+      }
+      final at = it.lastReadAt;
+      if (at == null) continue;
+      if (bestAt == null || at.isAfter(bestAt)) {
+        bestAt = at;
+        best = it;
+      }
+    }
+    return best;
+  }
+
+  Saga? _sagaContainingItem(LibraryItem it, List<Saga> sagas) {
+    for (final s in sagas) {
+      if (s.issues.any((o) => o.id == it.id)) return s;
+    }
+    return null;
+  }
+
+  /// Última leitura (volume + saga) para o ecrã Início.
+  ///
+  /// Se [lastReadAt] existir mas a saga falhar por dados antigos/incoerentes,
+  /// construímos uma saga mínima para o hero não ficar vazio.
+  ({LibraryItem issue, Saga saga})? _lastReadHeroTuple(List<Saga> sagas) {
+    final it = _latestReadIssueItem();
+    if (it == null) return null;
+    final s = _sagaContainingItem(it, sagas);
+    if (s != null) return (issue: it, saga: s);
+    final parsed = parseComicOriginalName(it.originalName);
+    final title =
+        parsed.sagaTitle.trim().isNotEmpty ? parsed.sagaTitle : it.displayName;
+    return (
+      issue: it,
+      saga: Saga(
+        id: 'o:${it.id}',
+        title: title,
+        issues: [it],
+      ),
+    );
+  }
+
+  void _openSagaDetail(Saga s, List<Saga> allSagas) {
+    Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SagaDetailScreen(
+          saga: s,
+          allSagas: allSagas,
+          onOpenIssue: (it) {
+            if (_getIndexForItem(it) < 0) return;
+            _openReader(it);
+          },
+          onMoveItems: (items, colId, colTitle) {
+            _moveItems(items, colId, colTitle);
+            Navigator.pop(context);
+          },
+          onCreateFolder: (items, title) {
+            _createFolderAndMove(items, title);
+            Navigator.pop(context);
+          },
+          onDeleteItems: (items) {
+            _deleteItems(items);
+            Navigator.pop(context);
+          },
+          onAddFiles: () async {
+            await _addFilesToSaga(s);
+            if (!mounted) return;
+            Navigator.pop(context);
+          },
+        ),
+      ),
+    ).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  Widget _mainNavigationBar(BuildContext context) {
+    final c = Theme.of(context).colorScheme;
+    return NavigationBarTheme(
+      data: NavigationBarThemeData(
+        height: 76,
+        indicatorColor: c.primary.withValues(alpha: 0.28),
+        surfaceTintColor: Colors.transparent,
+        shadowColor: Colors.black.withValues(alpha: 0.35),
+        elevation: 12,
+        indicatorShape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(22),
+        ),
+        overlayColor: const WidgetStatePropertyAll<Color>(Colors.transparent),
+        backgroundColor: c.surfaceContainerHigh.withValues(alpha: 0.96),
+      ),
+      child: SafeArea(
+        top: false,
+        minimum: EdgeInsets.zero,
+        child: NavigationBar(
+          selectedIndex: _boundedTabIndex,
+          onDestinationSelected: (value) => setState(() => _tabIndex = value),
+          labelBehavior: NavigationDestinationLabelBehavior.alwaysHide,
+          destinations: const [
+            NavigationDestination(
+              tooltip: 'Início',
+              label: ' ',
+              icon: Icon(Icons.home_outlined),
+              selectedIcon: Icon(Icons.home_rounded),
+            ),
+            NavigationDestination(
+              tooltip: 'Biblioteca',
+              label: ' ',
+              icon: Icon(Icons.menu_book_outlined),
+              selectedIcon: Icon(Icons.menu_book_rounded),
+            ),
+            NavigationDestination(
+              tooltip: 'Bibliotecas públicas',
+              label: ' ',
+              icon: Icon(Icons.cloud_download_outlined),
+              selectedIcon: Icon(Icons.cloud_download_rounded),
+            ),
+            NavigationDestination(
+              tooltip: 'Conta · entrar ou registar',
+              label: ' ',
+              icon: Icon(Icons.person_outline_rounded),
+              selectedIcon: Icon(Icons.person_rounded),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRecentHome(ColorScheme c, List<Saga> sagas) {
+    final hero = _lastReadHeroTuple(sagas);
+    return ColoredBox(
+      color: AppTheme.black,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _homePinnedHeader(context, c, hero != null),
+          Expanded(
+            child:
+                hero == null
+                    ? _homeEmptyNoRecentRead(c)
+                    : _homeLastReadHero(context, c, sagas, hero),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _homePinnedHeader(
+    BuildContext context,
+    ColorScheme c,
+    bool hasHero,
+  ) {
+    final topPad = MediaQuery.paddingOf(context).top;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            c.surfaceContainerLow.withValues(alpha: 0.52),
+            AppTheme.black,
+          ],
+        ),
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(24, topPad + 14, 24, 18),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            hasHero ? 'Continuar a ler' : 'Início',
+            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.45,
+              color: AppTheme.ink,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _homeEmptyNoRecentRead(ColorScheme c) {
+    return LayoutBuilder(
+      builder: (context, cons) {
+        return SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: cons.maxHeight),
+            child: Padding(
+              padding: const EdgeInsets.all(36),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  DecoratedBox(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: RadialGradient(
+                        colors: [
+                          c.primary.withValues(alpha: 0.35),
+                          c.primary.withValues(alpha: 0.08),
+                        ],
+                      ),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(28),
+                      child: Icon(
+                        Icons.auto_stories_rounded,
+                        size: 56,
+                        color: c.primary.withValues(alpha: 0.95),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+                  Text(
+                    'Ainda não abriste nenhum livro',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: -0.4,
+                      color: AppTheme.ink,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Na barra inferior, abre Biblioteca (2.º ícone) e importa um PDF '
+                    'ou banda desenhada. Depois de leres pelo menos uma vez, '
+                    'o último volume aparece aqui em grande, com Ler e Ouvir.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: AppTheme.muted,
+                      height: 1.5,
+                      fontSize: 15,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _homeLastReadHero(
+    BuildContext context,
+    ColorScheme c,
+    List<Saga> sagas,
+    ({LibraryItem issue, Saga saga}) hero,
+  ) {
+    return LayoutBuilder(
+      builder: (context, cons) {
+        final it = hero.issue;
+        final saga = hero.saga;
+        final coverPath = it.coverPath ?? saga.coverForDisplay;
+        final isPasta = saga.isPastaCollection;
+        final tot = it.totalPages;
+        final progD =
+            tot != null && tot > 0
+                ? ((it.lastPageIndex + 1) / tot).clamp(0.0, 1.0).toDouble()
+                : null;
+        final title = saga.title;
+        final sub = _SagaCard.continueLineFor(saga);
+        final canListen = it.format == BookFormat.pdf;
+        final cardW = math.min(
+          400.0,
+          math.max(260.0, cons.maxWidth * 0.88),
+        );
+        final maxCardH = math.max(180.0, cons.maxHeight * 0.55);
+        return Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+            physics: const BouncingScrollPhysics(
+              parent: AlwaysScrollableScrollPhysics(),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Hero(
+                  tag: 'vault_last_read_${it.id}',
+                  child: Material(
+                    color: Colors.transparent,
+                    elevation: 16,
+                    shadowColor: Colors.black.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(32),
+                    child: InkWell(
+                      onTap: () => _openReader(it),
+                      borderRadius: BorderRadius.circular(32),
+                      child: Container(
+                        width: cardW,
+                        constraints: BoxConstraints(maxHeight: maxCardH),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(32),
+                          border: Border.all(
+                            color: c.outline.withValues(alpha: 0.28),
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: c.primary.withValues(alpha: 0.12),
+                              blurRadius: 40,
+                              offset: const Offset(0, 18),
+                            ),
+                          ],
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: AspectRatio(
+                          aspectRatio: 0.68,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              localCoverImage(
+                                path: coverPath,
+                                fit: BoxFit.cover,
+                                gaplessPlayback: true,
+                                fallback: _SagaCard._coverFallback(
+                                  c,
+                                  folder: isPasta,
+                                ),
+                              ),
+                              DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Colors.transparent,
+                                      Colors.black.withValues(
+                                        alpha: 0.25,
+                                      ),
+                                      Colors.black.withValues(
+                                        alpha: 0.68,
+                                      ),
+                                    ],
+                                    stops: const [0.35, 0.65, 1],
+                                  ),
+                                ),
+                              ),
+                              Positioned(
+                                left: 14,
+                                right: 14,
+                                bottom: 14,
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    _HomeCircleAction(
+                                      icon: Icons.menu_book_rounded,
+                                      label: 'Ler',
+                                      gradient: [
+                                        c.primary,
+                                        c.tertiary.withValues(
+                                          alpha: 0.9,
+                                        ),
+                                      ],
+                                      onTap: () => _openReader(it),
+                                    ),
+                                    const SizedBox(width: 16),
+                                    _HomeCircleAction(
+                                      icon: Icons.record_voice_over_rounded,
+                                      label: 'Ouvir',
+                                      gradient:
+                                          canListen
+                                              ? [
+                                                const Color(0xFF6A1B9A),
+                                                c.primary.withValues(
+                                                  alpha: 0.92,
+                                                ),
+                                              ]
+                                              : [
+                                                c.surfaceContainerHighest,
+                                                c.outline.withValues(
+                                                  alpha: 0.55,
+                                                ),
+                                              ],
+                                      onTap:
+                                          () =>
+                                              canListen
+                                                  ? _openReadModeForPdf(it)
+                                                  : ScaffoldMessenger.of(
+                                                        context,
+                                                      )
+                                                      .showSnackBar(
+                                                        const SnackBar(
+                                                          behavior:
+                                                              SnackBarBehavior
+                                                                  .floating,
+                                                          content: Text(
+                                                            'Ouvir em voz (modo leitura) só está disponível para PDF.',
+                                                          ),
+                                                        ),
+                                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 26),
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: cardW),
+                  child: Column(
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 3,
+                        textAlign: TextAlign.center,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w800,
+                          height: 1.15,
+                          letterSpacing: -0.35,
+                          color: AppTheme.ink,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        it.displayName,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: c.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        sub,
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: c.onSurfaceVariant.withValues(
+                            alpha: 0.9,
+                          ),
+                        ),
+                      ),
+                      if (progD != null) ...[
+                        const SizedBox(height: 16),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: LinearProgressIndicator(
+                            value: progD,
+                            minHeight: 6,
+                            backgroundColor: c.outline.withValues(
+                              alpha: 0.35,
+                            ),
+                            color: c.primary,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      TextButton.icon(
+                        onPressed: () => _openSagaDetail(saga, sagas),
+                        icon: Icon(
+                          Icons.expand_more_rounded,
+                          color: c.primary,
+                        ),
+                        label: Text(
+                          'Ver na biblioteca',
+                          style: TextStyle(
+                            color: c.primary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildLibraryTab(ColorScheme c, List<Saga> sagas) {
+    return CustomScrollView(
+      physics: const BouncingScrollPhysics(
+        parent: AlwaysScrollableScrollPhysics(),
+      ),
+      slivers: [
+        SliverAppBar.large(
+          floating: true,
+          backgroundColor: AppTheme.black,
+          surfaceTintColor: Colors.transparent,
+          flexibleSpace: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  c.surfaceContainerLow.withValues(alpha: 0.55),
+                  AppTheme.black,
+                ],
+              ),
+            ),
+          ),
+          title: Text(
+            'Biblioteca',
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.4,
+                ),
+          ),
+          actions: [
+            if (_isAndroidDevice)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: IconButton.filledTonal(
+                  style: IconButton.styleFrom(
+                    backgroundColor:
+                        c.primaryContainer.withValues(alpha: 0.35),
+                  ),
+                  onPressed: () {
+                    unawaited(
+                      vaultMaybeRequestAndroidBackgroundPermissions(
+                        context,
+                        skipExplanation: true,
+                      ),
+                    );
+                  },
+                  icon: Icon(
+                    Icons.notifications_active_rounded,
+                    color: c.primary,
+                  ),
+                  tooltip:
+                      'Notificações e bateria (leitura em voz — Android)',
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: PopupMenuButton<String>(
+                tooltip: 'Importar ou adicionar',
+                position: PopupMenuPosition.under,
+                elevation: 12,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                onSelected: (v) async {
+                  switch (v) {
+                    case 'files':
+                      await _addFiles();
+                    case 'col':
+                      await _addFolder();
+                    case 'dir':
+                      await _importFolderFromDisk();
+                    case 'empty':
+                      _createEmptyFolder();
+                  }
+                },
+                itemBuilder:
+                    (ctx) => [
+                      PopupMenuItem(
+                        value: 'files',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: CircleAvatar(
+                            backgroundColor: c.primary.withValues(
+                              alpha: 0.16,
+                            ),
+                            child: Icon(
+                              Icons.file_open_outlined,
+                              color: c.primary,
+                              size: 20,
+                            ),
+                          ),
+                          title: const Text('Importar ficheiros'),
+                          subtitle: Text(
+                            'PDF, CBZ, CBR…',
+                            style: TextStyle(
+                              color: c.onSurfaceVariant,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'col',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: CircleAvatar(
+                            backgroundColor: c.tertiary.withValues(alpha: 0.2),
+                            child: Icon(
+                              Icons.collections_bookmark_outlined,
+                              color: c.tertiary,
+                              size: 20,
+                            ),
+                          ),
+                          title: const Text('Nova coleção'),
+                          subtitle: Text(
+                            'Nome e vários ficheiros',
+                            style: TextStyle(
+                              color: c.onSurfaceVariant,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                      PopupMenuItem(
+                        value: 'dir',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: CircleAvatar(
+                            backgroundColor:
+                                c.secondary.withValues(alpha: 0.2),
+                            child: Icon(
+                              Icons.folder_open_outlined,
+                              color: c.secondary,
+                              size: 20,
+                            ),
+                          ),
+                          title: const Text('Importar pasta do disco'),
+                          subtitle: Text(
+                            'Um álbum de uma só vez',
+                            style: TextStyle(
+                              color: c.onSurfaceVariant,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const PopupMenuDivider(),
+                      PopupMenuItem(
+                        value: 'empty',
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(
+                            Icons.create_new_folder_outlined,
+                            color: c.primary,
+                          ),
+                          title: const Text('Nova pasta vazia'),
+                          subtitle: Text(
+                            'Para arrastar livros dentro',
+                            style: TextStyle(
+                              color: c.onSurfaceVariant,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      gradient: LinearGradient(
+                        colors: [
+                          c.primary.withValues(alpha: 0.9),
+                          c.tertiary.withValues(alpha: 0.75),
+                        ],
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: c.primary.withValues(alpha: 0.35),
+                          blurRadius: 18,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.add_rounded, color: Colors.white),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Adicionar',
+                          style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                              ),
+                        ),
+                        const SizedBox(width: 6),
+                        const Icon(Icons.expand_more_rounded, color: Colors.white),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (sagas.isEmpty)
+          SliverFillRemaining(
+            hasScrollBody: false,
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                          colors: [
+                            c.primary.withValues(alpha: 0.22),
+                            c.tertiary.withValues(alpha: 0.12),
+                          ],
+                        ),
+                        border: Border.all(
+                          color: c.outline.withValues(alpha: 0.35),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: c.primary.withValues(alpha: 0.18),
+                            blurRadius: 28,
+                            offset: const Offset(0, 10),
+                          ),
+                        ],
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(26),
+                        child: Icon(
+                          Icons.auto_stories_rounded,
+                          size: 48,
+                          color: c.primary.withValues(alpha: 0.95),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 28),
+                    Text(
+                      'Começa por importar um livro',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: -0.2,
+                          ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Importa PDF, CBZ, CBR ou banda desenhada.\n'
+                      'Primeiro toca em «Adicionar» ↑ e escolhe como queres meter ficheiros na biblioteca.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: c.onSurfaceVariant,
+                        height: 1.45,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          )
+        else
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 28),
+            sliver: SliverGrid(
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                childAspectRatio: 0.62,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+              ),
+              delegate: SliverChildBuilderDelegate(
+                (context, i) {
+                  final s = sagas[i];
+                  final resume = s.resumeTargetItem;
+                  return _SagaCard(
+                    saga: s,
+                    isPastaAlbum: s.isPastaCollection,
+                    onDelete: () => _deleteItems(s.issues),
+                    onPlayResume:
+                        resume == null ? null : () => _openReader(resume),
+                    onReadAloud: resume != null &&
+                            resume.format == BookFormat.pdf
+                        ? () => _openReadModeForPdf(resume)
+                        : null,
+                    onTap: () => _openSagaDetail(s, sagas),
+                  );
+                },
+                childCount: sagas.length,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = Theme.of(context).colorScheme;
@@ -516,191 +1330,86 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     return Scaffold(
       backgroundColor: AppTheme.black,
-      body: CustomScrollView(
-        slivers: [
-          SliverAppBar.large(
-            floating: true,
-            backgroundColor: AppTheme.black,
-            surfaceTintColor: Colors.transparent,
-            flexibleSpace: DecoratedBox(
+      body: SizedBox.expand(
+        child: IndexedStack(
+          index: _boundedTabIndex,
+          children: [
+            _buildRecentHome(c, sagas),
+            _buildLibraryTab(c, sagas),
+            const PublicLibrariesScreen(),
+            AccountScreen(authApi: _vaultAuthApi, authStore: _vaultAuthStore),
+          ],
+        ),
+      ),
+      bottomNavigationBar: _mainNavigationBar(context),
+    );
+  }
+}
+
+class _HomeCircleAction extends StatelessWidget {
+  const _HomeCircleAction({
+    required this.icon,
+    required this.label,
+    required this.gradient,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final List<Color> gradient;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Material(
+          color: Colors.transparent,
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onTap,
+            child: Ink(
               decoration: BoxDecoration(
+                shape: BoxShape.circle,
                 gradient: LinearGradient(
+                  colors: gradient,
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
-                  colors: [
-                    c.surfaceContainerLow.withValues(alpha: 0.55),
-                    AppTheme.black,
-                  ],
                 ),
+                boxShadow: [
+                  BoxShadow(
+                    color: gradient.first.withValues(alpha: 0.42),
+                    blurRadius: 22,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Icon(icon, color: Colors.white, size: 34),
               ),
             ),
-            title: const Text('As tuas sagas'),
-            actions: [
-              if (!kIsWeb && Platform.isAndroid)
-                IconButton(
-                  onPressed: () {
-                    unawaited(
-                      vaultMaybeRequestAndroidBackgroundPermissions(
-                        context,
-                        skipExplanation: true,
-                      ),
-                    );
-                  },
-                  icon: const Icon(Icons.phonelink_setup_rounded),
-                  tooltip: 'Permissões para leitura em segundo plano',
-                ),
-              IconButton(
-                onPressed: _addFiles,
-                icon: const Icon(Icons.file_open_outlined),
-                tooltip: 'Importar ficheiros',
-              ),
-              IconButton(
-                onPressed: _addFolder,
-                icon: const Icon(Icons.library_add_outlined),
-                tooltip: 'Criar coleção (selecionar vários)',
-              ),
-              IconButton(
-                onPressed: _importFolderFromDisk,
-                icon: const Icon(Icons.folder_open_outlined),
-                tooltip: 'Importar pasta do disco',
-              ),
-              IconButton(
-                onPressed: _createEmptyFolder,
-                icon: const Icon(Icons.create_new_folder_outlined),
-                tooltip: 'Nova pasta vazia',
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          label,
+          style: t.labelLarge?.copyWith(
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.15,
+            color: Colors.white,
+            shadows: [
+              Shadow(
+                color: Colors.black.withValues(alpha: 0.62),
+                blurRadius: 14,
+                offset: Offset(0, 2),
               ),
             ],
           ),
-          if (sagas.isEmpty)
-            SliverFillRemaining(
-              hasScrollBody: false,
-              child: Padding(
-                padding: const EdgeInsets.all(28),
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      DecoratedBox(
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: LinearGradient(
-                            colors: [
-                              c.primary.withValues(alpha: 0.22),
-                              c.tertiary.withValues(alpha: 0.12),
-                            ],
-                          ),
-                          border: Border.all(
-                            color: c.outline.withValues(alpha: 0.35),
-                          ),
-                          boxShadow: [
-                            BoxShadow(
-                              color: c.primary.withValues(alpha: 0.18),
-                              blurRadius: 28,
-                              offset: const Offset(0, 10),
-                            ),
-                          ],
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.all(26),
-                          child: Icon(
-                            Icons.auto_stories_rounded,
-                            size: 48,
-                            color: c.primary.withValues(alpha: 0.95),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 28),
-                      Text(
-                        'Começa por importar um livro',
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: -0.2,
-                            ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        'Importa PDF, CBZ, CBR, CB7, CBT…\n'
-                        'Usa o ícone de ficheiro para avulsos,\n'
-                        'ou coleções para agrupar numa pasta.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: c.onSurfaceVariant,
-                          height: 1.45,
-                          fontSize: 14,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            )
-          else
-            SliverPadding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 28),
-              sliver: SliverGrid(
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  childAspectRatio: 0.62,
-                  crossAxisSpacing: 12,
-                  mainAxisSpacing: 12,
-                ),
-                delegate: SliverChildBuilderDelegate(
-                  (context, i) {
-                    final s = sagas[i];
-                    final resume = s.resumeTargetItem;
-                    return _SagaCard(
-                      saga: s,
-                      isPastaAlbum: s.isPastaCollection,
-                      onDelete: () => _deleteItems(s.issues),
-                      onPlayResume:
-                          resume == null ? null : () => _openReader(resume),
-                      onReadAloud: resume != null &&
-                              resume.format == BookFormat.pdf
-                          ? () => _openReadModeForPdf(resume)
-                          : null,
-                      onTap: () {
-                        Navigator.push<void>(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => SagaDetailScreen(
-                              saga: s,
-                              allSagas: sagas,
-                              onOpenIssue: (it) {
-                                if (_getIndexForItem(it) < 0) return;
-                                _openReader(it);
-                              },
-                              onMoveItems: (items, colId, colTitle) {
-                                _moveItems(items, colId, colTitle);
-                                Navigator.pop(context);
-                              },
-                              onCreateFolder: (items, title) {
-                                _createFolderAndMove(items, title);
-                                Navigator.pop(context);
-                              },
-                              onDeleteItems: (items) {
-                                _deleteItems(items);
-                                Navigator.pop(context);
-                              },
-                              onAddFiles: () async {
-                                await _addFilesToSaga(s);
-                                if (!context.mounted) return;
-                                Navigator.pop(context);
-                              },
-                            ),
-                          ),
-                        ).then((_) {
-                          if (mounted) setState(() {});
-                        });
-                      },
-                    );
-                  },
-                  childCount: sagas.length,
-                ),
-              ),
-            ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }
@@ -767,6 +1476,8 @@ class _SagaCard extends StatelessWidget {
     return 'A ler$cap';
   }
 
+  static String continueLineFor(Saga s) => _continueLine(s);
+
   @override
   Widget build(BuildContext context) {
     final c = Theme.of(context).colorScheme;
@@ -775,7 +1486,7 @@ class _SagaCard extends StatelessWidget {
     final prog = saga.lastReadProgress;
     return Container(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(24),
         border: Border.all(
           color: c.outline.withValues(alpha: 0.4),
         ),
@@ -789,7 +1500,7 @@ class _SagaCard extends StatelessWidget {
       ),
       child: Material(
         color: c.surfaceContainerHigh,
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(24),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: onTap,
@@ -804,16 +1515,12 @@ class _SagaCard extends StatelessWidget {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    if (path != null && File(path).existsSync())
-                      Image.file(
-                        File(path),
-                        fit: BoxFit.cover,
-                        gaplessPlayback: true,
-                        errorBuilder: (context, error, stack) =>
-                            _coverFallback(c, folder: isPastaAlbum),
-                      )
-                    else
-                      _coverFallback(c, folder: isPastaAlbum),
+                    localCoverImage(
+                      path: path,
+                      fit: BoxFit.cover,
+                      gaplessPlayback: true,
+                      fallback: _coverFallback(c, folder: isPastaAlbum),
+                    ),
                     Container(
                       decoration: BoxDecoration(
                         gradient: LinearGradient(

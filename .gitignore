@@ -33,6 +33,9 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Backend Python vive fora do repo: ../valt-catalog-api
+/server/
+
 # Symbolication related
 app.*.symbols
 

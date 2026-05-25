@@ -4,6 +4,8 @@ import 'package:sherpa_onnx/sherpa_onnx.dart';
 
 /// Isolate com um único [OfflineTts] — síntese não bloqueia o isolate principal
 /// (event loop da UI). Pedidos são tratados em sequência (filamento interno `await for`).
+///
+/// Suporta [OfflineTtsVitsModelConfig] (voz Piper / Faber / Cadu em ONNX).
 @pragma('vm:entry-point')
 void sherpaTtsWorkerMain(List<Object?> args) async {
   /// Obrigatório em *cada* isolate que use Sherpa — no `main.dart` só corre no
@@ -16,6 +18,8 @@ void sherpaTtsWorkerMain(List<Object?> args) async {
   final rp = ReceivePort();
   replyToMain.send(rp.sendPort);
 
+  final numThreads = (init['numThreads'] as num).toInt();
+
   final vits = OfflineTtsVitsModelConfig(
     model: init['onnx'] as String,
     tokens: init['tokens'] as String,
@@ -24,15 +28,17 @@ void sherpaTtsWorkerMain(List<Object?> args) async {
     noiseScaleW: (init['noiseScaleW'] as num).toDouble(),
     lengthScale: (init['lengthScale'] as num).toDouble(),
   );
-  final modelCfg = OfflineTtsModelConfig(
-    vits: vits,
-    numThreads: (init['numThreads'] as num).toInt(),
-    // Evitar `kDebugMode` do Flutter neste isolate — importar `foundation`
-    // no worker quebra o debug do Flutter; Sherpa em debug nativo é mais lento.
-    debug: false,
-    provider: 'cpu',
+  final tts = OfflineTts(
+    OfflineTtsConfig(
+      model: OfflineTtsModelConfig(
+        vits: vits,
+        numThreads: numThreads,
+        // Evitar `kDebugMode` neste isolate.
+        debug: false,
+        provider: 'cpu',
+      ),
+    ),
   );
-  final tts = OfflineTts(OfflineTtsConfig(model: modelCfg));
 
   await for (final dynamic raw in rp) {
     final msg = Map<String, dynamic>.from(raw as Map);
@@ -52,7 +58,9 @@ void sherpaTtsWorkerMain(List<Object?> args) async {
         );
         continue;
       }
-      final wav = tts.generate(text: text, sid: 0, speed: 1.0);
+      final sid = (msg['sid'] as num?)?.toInt() ?? 0;
+      final speed = (msg['speed'] as num?)?.toDouble() ?? 1.0;
+      final wav = tts.generate(text: text, sid: sid, speed: speed);
       if (wav.samples.isEmpty || wav.sampleRate <= 0) {
         replyToMain.send(
           {'id': id, 'ok': false, 'error': 'TTS não gerou áudio.'},

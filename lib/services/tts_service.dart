@@ -13,27 +13,26 @@ import 'package:path_provider/path_provider.dart';
 import 'sherpa_tts_isolate.dart';
 import 'vault_reading_audio.dart';
 
-/// Nova pasta quando os ficheiros em cache ficam estragados (ex.: cópias
+/// Nova pasta quando os ficheiros em cache ficam estragadas (ex.: cópias
 /// incompletas) — faz com que todos os ONNX/tokens/etc. voltem a ser escritos.
 /// Bump quando mudar formato da cache (ex.: normalização CRLF nos `.txt`).
-const String _ttsCacheDirName = 'vault_sherpa_tts_v6';
+const String _ttsCacheDirName = 'vault_sherpa_tts_v9';
 
-/// VITS/Piper offline via Sherpa-ONNX (`miro`, `dii`, `faber`).
-///
-/// Incluir em `assets/tts/` (e pubspec): `*.onnx`, tokens, `.onnx.json` e
-/// `espeak-ng-data/` completa (phonemas PT‑BR — necessária).
+/// Faber em subpasta [assets/tts/Faber/]; Cadu em [assets/tts/cadu/] (`README_CADU.md`).
 class TtsService {
   TtsService._();
   static final TtsService instance = TtsService._();
 
-  static final _tokensByModel = <String, String>{
-    'miro': 'tokens_miro.txt',
-    'dii': 'tokens_dii.txt',
-    'faber': 'tokens_faber.txt',
-  };
+  static const _faberSubdir = 'Faber';
+
+  static const _faberTokensLeaf = 'tokens_faber.txt';
+  static const _caduTokensLeaf = 'tokens_cadu.txt';
 
   String? _workerLoadedModel;
   Directory? _cacheDir;
+
+  /// [generate] `sid` do Piper mono-voice (Faber ou Cadu ⇒ 0).
+  int _ttsGenSpeakerId = 0;
 
   Future<void>? _bundlesCopied;
   AudioPlayer? _fallbackPlayer;
@@ -106,7 +105,73 @@ class TtsService {
     }
   }
 
+  Future<
+      ({
+        String onnx,
+        String jsonMeta,
+        String tokens,
+      })> _resolveCaduPiperLeaves(Directory bundle) async {
+    if (!await bundle.exists()) {
+      throw StateError(
+        'assets/tts/cadu/ não existe na cache da app '
+        '(esperado após primeiro arranque com assets no pubspec).',
+      );
+    }
 
+    Future<String?> pickOnnx() async {
+      final pref = File(p.join(bundle.path, 'cadu.onnx'));
+      if (await pref.exists()) return pref.path;
+
+      final onx = <String>[];
+      try {
+        await for (final e in bundle.list(followLinks: false)) {
+          if (e is! File) continue;
+          if (!e.path.toLowerCase().endsWith('.onnx')) continue;
+          onx.add(e.path);
+        }
+      } catch (_) {}
+      onx.sort();
+      return onx.isEmpty ? null : onx.first;
+    }
+
+    Future<String?> pickTokens() async {
+      for (final leaf in <String>[
+        _caduTokensLeaf,
+        'tokens.txt',
+      ]) {
+        final f = File(p.join(bundle.path, leaf));
+        if (await f.exists()) return f.path;
+      }
+      return null;
+    }
+
+    final onnx = await pickOnnx();
+    if (onnx == null) {
+      throw StateError(
+        'Cadu: falta *.onnx em assets/tts/cadu/ '
+        '(podes usar cadu.onnx ou o nome Piper, ex. pt_BR-cadu-medium.onnx).',
+      );
+    }
+
+    final tokens = await pickTokens();
+    if (tokens == null) {
+      throw StateError(
+        'Cadu: falta tokens_cadu.txt ou tokens.txt ao lado do ONNX '
+        '(copia tokens.txt da mesma distribuição Piper).',
+      );
+    }
+
+    final stemOnnx =
+        onnx.replaceFirst(RegExp(r'\.onnx$', caseSensitive: false), '');
+    final siblingJson = '$stemOnnx.onnx.json';
+    if (await File(siblingJson).exists()) {
+      return (onnx: onnx, jsonMeta: siblingJson, tokens: tokens);
+    }
+
+    throw StateError(
+      'Cadu: falta ficheiro de metadados junto ao modelo (${p.basename(siblingJson)}).',
+    );
+  }
 
   Future<void> initTts(String modelName) async {
     if (kIsWeb) {
@@ -114,34 +179,65 @@ class TtsService {
     }
 
     final normalized = modelName.toLowerCase().trim();
-    final tokensLeaf = _tokensByModel[normalized];
-    if (tokensLeaf == null) {
+    if (normalized != 'faber' && normalized != 'cadu') {
       throw ArgumentError(
-        'modelName: usar miro, dii ou faber (recebido: $modelName)',
+        'modelName: usar faber ou cadu (recebido: $modelName)',
       );
     }
     await _ensureBundlesCopied(normalized);
 
     final base = _cacheDir!;
-    final onnxPath = p.join(base.path, '$normalized.onnx');
-    final tokensPath = p.join(base.path, tokensLeaf);
-    final jsonPath = p.join(base.path, '$normalized.onnx.json');
+
+    final cores = Platform.numberOfProcessors;
+    final threads =
+        min(3, cores <= 2 ? 1 : (cores <= 5 ? 2 : 3));
+
+    late final Map<String, Object?> initMap;
+
+    final caduBundle = Directory(p.join(base.path, 'cadu'));
+    late final String onnxPath;
+    late final String tokensPath;
+    late final String jsonPath;
+
+    if (normalized == 'faber') {
+      final faberDir = p.join(base.path, _faberSubdir);
+      onnxPath = p.join(faberDir, 'faber.onnx');
+      tokensPath = p.join(faberDir, _faberTokensLeaf);
+      jsonPath = p.join(faberDir, 'faber.onnx.json');
+    } else {
+      final resolved = await _resolveCaduPiperLeaves(caduBundle);
+      onnxPath = resolved.onnx;
+      tokensPath = resolved.tokens;
+      jsonPath = resolved.jsonMeta;
+    }
+
     final dataDirPath = p.join(base.path, 'espeak-ng-data');
 
     await _failIfMissingFile(
       onnxPath,
-      'Falta o ficheiro ONNX (assets/tts/$normalized.onnx)',
+      normalized == 'faber'
+          ? 'Falta assets/tts/Faber/faber.onnx'
+          : 'Falta ONNX em assets/tts/cadu/ '
+              '(cadu.onnx ou outro *.onnx, ex. pt_*-cadu-*.onnx)',
     );
-    await _failIfMissingFile(tokensPath, 'Falta ficheiro de tokens');
+    await _failIfMissingFile(
+      tokensPath,
+      normalized == 'faber'
+          ? 'Falta assets/tts/Faber/tokens_faber.txt'
+          : 'Falta tokens em assets/tts/cadu/ '
+              '(tokens_cadu.txt ou tokens.txt — vêm no zip Piper com o modelo)',
+    );
     _validateSherpaStyleTokens(tokensPath);
 
     final phonPath = p.join(dataDirPath, 'phondata');
     if (!await File(phonPath).exists()) {
       throw StateError(
         'Copie para assets/tts/espeak-ng-data/ a pasta completa espeak-ng-data '
-        '(p.ex. modelo Sherpa-Piper pré‑montado precisa dos ficheiros phondata, phonindex, …).',
+        '(phondata, phonindex, …).',
       );
     }
+
+    _ttsGenSpeakerId = 0;
 
     if (_workerLoadedModel == normalized && _ttsWorkerSend != null) {
       return;
@@ -155,28 +251,19 @@ class TtsService {
       if (await jf.exists()) {
         final wrap =
             json.decode(await jf.readAsString()) as Map<String, dynamic>;
-        final inf =
-            wrap['inference'] as Map<String, dynamic>? ?? const {};
-        noiseScale = (inf['noise_scale'] as num?)?.toDouble() ?? noiseScale;
+        final inf = wrap['inference'] as Map<String, dynamic>? ?? const {};
+        noiseScale =
+            (inf['noise_scale'] as num?)?.toDouble() ?? noiseScale;
         noiseScaleW = (inf['noise_w'] as num?)?.toDouble() ?? noiseScaleW;
-        lengthScale = (inf['length_scale'] as num?)?.toDouble() ?? lengthScale;
+        lengthScale =
+            (inf['length_scale'] as num?)?.toDouble() ?? lengthScale;
       }
     } catch (_) {
       /* metadados opcionais */
     }
 
-    /// Telemóveis fracos: 1 thread pode ser menos agressivo com CPU/memória.
-    /// Máximo 3 para desktops com muitos núcleos.
-    final cores = Platform.numberOfProcessors;
-    final threads = kIsWeb
-        ? 2
-        : min(3, cores <= 2 ? 1 : (cores <= 5 ? 2 : 3));
-
-    _shutdownTtsWorker();
-
-    final mainRp = ReceivePort();
-    _ttsMainReceive = mainRp;
-    final initMap = <String, Object?>{
+    initMap = <String, Object?>{
+      'kind': 'vits',
       'onnx': onnxPath,
       'tokens': tokensPath,
       'dataDir': dataDirPath,
@@ -185,6 +272,11 @@ class TtsService {
       'lengthScale': lengthScale,
       'numThreads': threads,
     };
+
+    _shutdownTtsWorker();
+
+    final mainRp = ReceivePort();
+    _ttsMainReceive = mainRp;
 
     final boot = Completer<SendPort>();
     late StreamSubscription<Object?> sub;
@@ -277,6 +369,8 @@ class TtsService {
       'id': id,
       'text': text,
       'outPath': out.path,
+      'sid': _ttsGenSpeakerId,
+      'speed': 1.0,
     });
     return c.future;
   }
@@ -407,12 +501,17 @@ class TtsService {
     if (pl != null) await pl.play();
   }
 
-  /// Só copia espeak-ng-data + o modelo pedido (~60 MB em vez de ~180 MB).
+  /// Só copia espeak‑ng + ONNX/tokens do modelo VITS escolhido.
   bool _assetNeededForModel(String rel, String model) {
+    final m = model.toLowerCase();
     if (rel.startsWith('espeak-ng-data/')) return true;
-    return rel == '$model.onnx' ||
-        rel == '$model.onnx.json' ||
-        rel == 'tokens_$model.txt';
+    if (m == 'faber') {
+      return rel.startsWith('$_faberSubdir/');
+    }
+    if (m == 'cadu') {
+      return rel.startsWith('cadu/');
+    }
+    return false;
   }
 
   Future<void> _ensureBundlesCopied(String modelName) async {
@@ -467,6 +566,9 @@ class TtsService {
         'vault_sherpa_tts_v3',
         'vault_sherpa_tts_v4',
         'vault_sherpa_tts_v5',
+        'vault_sherpa_tts_v6',
+        'vault_sherpa_tts_v7',
+        'vault_sherpa_tts_v8',
       ]) {
         try {
           final d = Directory(p.join(doc.path, legacyName));

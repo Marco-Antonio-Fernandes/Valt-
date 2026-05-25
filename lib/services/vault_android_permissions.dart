@@ -21,7 +21,19 @@ Future<void> vaultMaybeRequestAndroidBackgroundPermissions(
   final notifOk = (await Permission.notification.status).isGranted;
   final batOk =
       (await Permission.ignoreBatteryOptimizations.status).isGranted;
-  if (notifOk && batOk) return;
+  if (notifOk && batOk) {
+    if (skipExplanation && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text(
+            'Som em segundo plano: notificações e bateria já estão tratadas neste equipamento.',
+          ),
+        ),
+      );
+    }
+    return;
+  }
 
   final prefs = await SharedPreferences.getInstance();
   final introDone = prefs.getBool(_kVaultBgPermIntroDone) ?? false;
