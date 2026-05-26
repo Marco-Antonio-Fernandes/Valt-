@@ -33,7 +33,6 @@ void sherpaTtsWorkerMain(List<Object?> args) async {
       model: OfflineTtsModelConfig(
         vits: vits,
         numThreads: numThreads,
-        // Evitar `kDebugMode` neste isolate.
         debug: false,
         provider: 'cpu',
       ),

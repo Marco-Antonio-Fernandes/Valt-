@@ -5,5 +5,6 @@ Widget localCoverImage({
   required Widget fallback,
   BoxFit fit = BoxFit.cover,
   bool gaplessPlayback = true,
+  bool heroBackdropLayout = false,
 }) =>
     fallback;

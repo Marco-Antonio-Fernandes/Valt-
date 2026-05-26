@@ -16,22 +16,27 @@ import 'vault_reading_audio.dart';
 /// Nova pasta quando os ficheiros em cache ficam estragadas (ex.: cópias
 /// incompletas) — faz com que todos os ONNX/tokens/etc. voltem a ser escritos.
 /// Bump quando mudar formato da cache (ex.: normalização CRLF nos `.txt`).
-const String _ttsCacheDirName = 'vault_sherpa_tts_v9';
+const String _ttsCacheDirName = 'vault_sherpa_tts_v12';
 
-/// Faber em subpasta [assets/tts/Faber/]; Cadu em [assets/tts/cadu/] (`README_CADU.md`).
+/// Vozes pt_BR bundled no APK (assets/tts/pt_BR/…).
+/// Chave = voice_key normalizado, valor = prefixo no asset bundle.
+const Map<String, String> _bundledPtBrVoices = {
+  'pt_br-cadu-medium': 'assets/tts/pt_BR/cadu/medium/',
+  'pt_br-edresson-low': 'assets/tts/pt_BR/edresson/low/',
+  'pt_br-faber-medium': 'assets/tts/pt_BR/faber/medium/',
+  'pt_br-jeff-medium': 'assets/tts/pt_BR/jeff/medium/',
+};
+
+/// Vozes Piper: pt_BR bundled no APK + outras descarregadas do servidor.
+/// Cada pasta em `vault_sherpa_tts_v12/{voice_key}/` contém `.onnx` + `.onnx.json`;
+/// tokens gerados automaticamente a partir do `phoneme_id_map`.
 class TtsService {
   TtsService._();
   static final TtsService instance = TtsService._();
 
-  static const _faberSubdir = 'Faber';
-
-  static const _faberTokensLeaf = 'tokens_faber.txt';
-  static const _caduTokensLeaf = 'tokens_cadu.txt';
-
   String? _workerLoadedModel;
   Directory? _cacheDir;
 
-  /// [generate] `sid` do Piper mono-voice (Faber ou Cadu ⇒ 0).
   int _ttsGenSpeakerId = 0;
 
   Future<void>? _bundlesCopied;
@@ -48,8 +53,12 @@ class TtsService {
 
   String? get currentModel => _workerLoadedModel;
 
+  /// Chave única das pastas em `vault_sherpa_tts_v12/` — prefs Sherpa sempre em minúsculas;
+  /// o downloader deve usar o mesmo nome para coincidir com Android (FS case-sensitive).
+  static String normalizedVoiceFolderName(String modelName) =>
+      modelName.toLowerCase().trim();
+
   Future<void> ensureBundlesAndInit(String modelName) async {
-    await _ensureBundlesCopied(modelName);
     await initTts(modelName);
   }
 
@@ -105,23 +114,23 @@ class TtsService {
     }
   }
 
+  /// Resolve ONNX + JSON + tokens para qualquer bundle Piper (Cadu ou voz baixada).
+  /// Se `tokens.txt` não existir mas o `.onnx.json` contiver `phoneme_id_map`,
+  /// gera automaticamente o ficheiro — modelos Piper modernos não distribuem
+  /// tokens separados.
   Future<
       ({
         String onnx,
         String jsonMeta,
         String tokens,
-      })> _resolveCaduPiperLeaves(Directory bundle) async {
+      })> _resolvePiperBundle(Directory bundle, {String label = 'Voz'}) async {
     if (!await bundle.exists()) {
       throw StateError(
-        'assets/tts/cadu/ não existe na cache da app '
-        '(esperado após primeiro arranque com assets no pubspec).',
+        '$label: pasta não existe (${bundle.path}).',
       );
     }
 
     Future<String?> pickOnnx() async {
-      final pref = File(p.join(bundle.path, 'cadu.onnx'));
-      if (await pref.exists()) return pref.path;
-
       final onx = <String>[];
       try {
         await for (final e in bundle.list(followLinks: false)) {
@@ -135,42 +144,101 @@ class TtsService {
     }
 
     Future<String?> pickTokens() async {
-      for (final leaf in <String>[
-        _caduTokensLeaf,
-        'tokens.txt',
-      ]) {
-        final f = File(p.join(bundle.path, leaf));
-        if (await f.exists()) return f.path;
-      }
+      try {
+        await for (final e in bundle.list(followLinks: false)) {
+          if (e is! File) continue;
+          final name = p.basename(e.path).toLowerCase();
+          if (name.startsWith('tokens') && name.endsWith('.txt')) return e.path;
+        }
+      } catch (_) {}
       return null;
     }
 
     final onnx = await pickOnnx();
     if (onnx == null) {
       throw StateError(
-        'Cadu: falta *.onnx em assets/tts/cadu/ '
-        '(podes usar cadu.onnx ou o nome Piper, ex. pt_BR-cadu-medium.onnx).',
-      );
-    }
-
-    final tokens = await pickTokens();
-    if (tokens == null) {
-      throw StateError(
-        'Cadu: falta tokens_cadu.txt ou tokens.txt ao lado do ONNX '
-        '(copia tokens.txt da mesma distribuição Piper).',
+        '$label: falta *.onnx na pasta (${bundle.path}).',
       );
     }
 
     final stemOnnx =
         onnx.replaceFirst(RegExp(r'\.onnx$', caseSensitive: false), '');
     final siblingJson = '$stemOnnx.onnx.json';
-    if (await File(siblingJson).exists()) {
-      return (onnx: onnx, jsonMeta: siblingJson, tokens: tokens);
+    if (!await File(siblingJson).exists()) {
+      throw StateError(
+        '$label: falta metadados (${p.basename(siblingJson)}).',
+      );
     }
 
-    throw StateError(
-      'Cadu: falta ficheiro de metadados junto ao modelo (${p.basename(siblingJson)}).',
-    );
+    final tokens = await pickTokens() ??
+        await _generateTokensFromJson(siblingJson, bundle.path, label);
+
+    return (onnx: onnx, jsonMeta: siblingJson, tokens: tokens);
+  }
+
+  /// Pasta com `.onnx`: tenta `normalizedFolderName`, depois fallback **só por mudança maiúsculas**
+  /// (downloads antigos criavam `pt_PT-…` enquanto prefs usam `pt_pt-…` no Android).
+  Future<Directory> _resolveVoiceOnnxInstallDir({
+    required Directory directory,
+    required String normalizedFolderName,
+  }) async {
+    final direct = Directory(p.join(directory.path, normalizedFolderName));
+    if (await direct.exists()) return direct;
+    try {
+      await for (final e in directory.list(followLinks: false)) {
+        if (e is! Directory) continue;
+        final bn = p.basename(e.path);
+        if (bn.toLowerCase() != normalizedFolderName) continue;
+        final found = Directory(e.path);
+        if (bn != normalizedFolderName) {
+          try {
+            await found.rename(direct.path);
+            if (await direct.exists()) return direct;
+          } catch (_) {
+            /* usar pasta legacy se rename falhar (ex.: cross-device) */
+          }
+        }
+        return found;
+      }
+    } catch (_) {}
+    return direct;
+  }
+
+  /// Gera `tokens.txt` a partir do `phoneme_id_map` no `.onnx.json`.
+  Future<String> _generateTokensFromJson(
+      String jsonPath, String outputDir, String label) async {
+    final jf = File(jsonPath);
+    final Map<String, dynamic> wrap;
+    try {
+      wrap = json.decode(await jf.readAsString()) as Map<String, dynamic>;
+    } catch (e) {
+      throw StateError('$label: não foi possível ler $jsonPath ($e).');
+    }
+
+    final pm = wrap['phoneme_id_map'] as Map<String, dynamic>?;
+    if (pm == null || pm.isEmpty) {
+      throw StateError(
+        '$label: .onnx.json não contém phoneme_id_map — impossível gerar tokens.',
+      );
+    }
+
+    final entries = <(int, String)>[];
+    for (final entry in pm.entries) {
+      final ids = entry.value;
+      if (ids is List && ids.isNotEmpty) {
+        entries.add(((ids.first as num).toInt(), entry.key));
+      }
+    }
+    entries.sort((a, b) => a.$1.compareTo(b.$1));
+
+    final buf = StringBuffer();
+    for (final (id, sym) in entries) {
+      buf.writeln('$sym $id');
+    }
+
+    final outPath = p.join(outputDir, 'tokens.txt');
+    await File(outPath).writeAsString(buf.toString());
+    return outPath;
   }
 
   Future<void> initTts(String modelName) async {
@@ -178,13 +246,12 @@ class TtsService {
       throw StateError('Sherpa ONNX não está disponível na web.');
     }
 
-    final normalized = modelName.toLowerCase().trim();
-    if (normalized != 'faber' && normalized != 'cadu') {
-      throw ArgumentError(
-        'modelName: usar faber ou cadu (recebido: $modelName)',
-      );
+    final normalized = normalizedVoiceFolderName(modelName);
+    await _ensureEspeakCopied();
+
+    if (_bundledPtBrVoices.containsKey(normalized)) {
+      await _copyBundledVoiceIfMissing(normalized);
     }
-    await _ensureBundlesCopied(normalized);
 
     final base = _cacheDir!;
 
@@ -194,39 +261,20 @@ class TtsService {
 
     late final Map<String, Object?> initMap;
 
-    final caduBundle = Directory(p.join(base.path, 'cadu'));
-    late final String onnxPath;
-    late final String tokensPath;
-    late final String jsonPath;
-
-    if (normalized == 'faber') {
-      final faberDir = p.join(base.path, _faberSubdir);
-      onnxPath = p.join(faberDir, 'faber.onnx');
-      tokensPath = p.join(faberDir, _faberTokensLeaf);
-      jsonPath = p.join(faberDir, 'faber.onnx.json');
-    } else {
-      final resolved = await _resolveCaduPiperLeaves(caduBundle);
-      onnxPath = resolved.onnx;
-      tokensPath = resolved.tokens;
-      jsonPath = resolved.jsonMeta;
-    }
+    final voiceDir =
+        await _resolveVoiceOnnxInstallDir(directory: base, normalizedFolderName: normalized);
+    final resolved = await _resolvePiperBundle(
+      voiceDir,
+      label: normalized,
+    );
+    final onnxPath = resolved.onnx;
+    final tokensPath = resolved.tokens;
+    final jsonPath = resolved.jsonMeta;
 
     final dataDirPath = p.join(base.path, 'espeak-ng-data');
 
-    await _failIfMissingFile(
-      onnxPath,
-      normalized == 'faber'
-          ? 'Falta assets/tts/Faber/faber.onnx'
-          : 'Falta ONNX em assets/tts/cadu/ '
-              '(cadu.onnx ou outro *.onnx, ex. pt_*-cadu-*.onnx)',
-    );
-    await _failIfMissingFile(
-      tokensPath,
-      normalized == 'faber'
-          ? 'Falta assets/tts/Faber/tokens_faber.txt'
-          : 'Falta tokens em assets/tts/cadu/ '
-              '(tokens_cadu.txt ou tokens.txt — vêm no zip Piper com o modelo)',
-    );
+    await _failIfMissingFile(onnxPath, '$normalized: falta ficheiro ONNX.');
+    await _failIfMissingFile(tokensPath, '$normalized: falta tokens.');
     _validateSherpaStyleTokens(tokensPath);
 
     final phonPath = p.join(dataDirPath, 'phondata');
@@ -501,97 +549,102 @@ class TtsService {
     if (pl != null) await pl.play();
   }
 
-  /// Só copia espeak‑ng + ONNX/tokens do modelo VITS escolhido.
-  bool _assetNeededForModel(String rel, String model) {
-    final m = model.toLowerCase();
-    if (rel.startsWith('espeak-ng-data/')) return true;
-    if (m == 'faber') {
-      return rel.startsWith('$_faberSubdir/');
-    }
-    if (m == 'cadu') {
-      return rel.startsWith('cadu/');
-    }
-    return false;
-  }
+  /// Lista de voice_keys pt_BR que já vêm bundled no APK.
+  static List<String> get bundledVoiceKeys =>
+      _bundledPtBrVoices.keys.toList(growable: false);
 
-  Future<void> _ensureBundlesCopied(String modelName) async {
-    final normalized = modelName.toLowerCase().trim();
-    if (_bundlesCopied != null) {
-      await _bundlesCopied!;
-    } else {
-      _bundlesCopied = _copySherpaAssetsOnce(normalized);
-      await _bundlesCopied!;
-    }
-    await _copySherpaModelIfMissing(normalized);
-  }
-
-  Future<void> _copySherpaModelIfMissing(String model) async {
+  /// Copia .onnx + .onnx.json de um voice bundled para cache, se ainda não existir.
+  Future<void> _copyBundledVoiceIfMissing(String voiceKey) async {
     final base = _cacheDir;
     if (base == null) return;
+    final assetPrefix = _bundledPtBrVoices[voiceKey];
+    if (assetPrefix == null) return;
+
+    final destDir = Directory(p.join(base.path, voiceKey));
+    if (await destDir.exists()) {
+      var hasOnnx = false;
+      await for (final e in destDir.list(followLinks: false)) {
+        if (e is File && e.path.toLowerCase().endsWith('.onnx')) {
+          hasOnnx = true;
+          break;
+        }
+      }
+      if (hasOnnx) return;
+    }
+    await destDir.create(recursive: true);
+
+    final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
+    for (final key in manifest.listAssets()) {
+      if (!key.startsWith(assetPrefix)) continue;
+      final fileName = key.substring(assetPrefix.length);
+      if (fileName.contains('/')) continue;
+      if (!fileName.endsWith('.onnx') && !fileName.endsWith('.onnx.json')) {
+        continue;
+      }
+      final dest = File(p.join(destDir.path, fileName));
+      if (await dest.exists()) continue;
+      final bytes = await rootBundle.load(key);
+      await dest.writeAsBytes(bytes.buffer.asUint8List());
+    }
+  }
+
+  /// Copia apenas espeak-ng-data do bundle de assets para cache local.
+  Future<void> _ensureEspeakCopied() async {
+    if (_bundlesCopied != null) {
+      await _bundlesCopied!;
+      return;
+    }
+    _bundlesCopied = _copyEspeakAssetsOnce();
+    await _bundlesCopied!;
+  }
+
+  Future<void> _copyEspeakAssetsOnce() async {
+    final doc = await getApplicationDocumentsDirectory();
+
+    for (final legacyName in [
+      'vault_sherpa_tts',
+      'vault_sherpa_tts_v2',
+      'vault_sherpa_tts_v3',
+      'vault_sherpa_tts_v4',
+      'vault_sherpa_tts_v5',
+      'vault_sherpa_tts_v6',
+      'vault_sherpa_tts_v7',
+      'vault_sherpa_tts_v8',
+      'vault_sherpa_tts_v9',
+      'vault_sherpa_tts_v10',
+      'vault_sherpa_tts_v11',
+    ]) {
+      try {
+        final d = Directory(p.join(doc.path, legacyName));
+        if (await d.exists()) {
+          await d.delete(recursive: true);
+        }
+      } catch (_) {}
+    }
+
+    _cacheDir = Directory(p.join(doc.path, _ttsCacheDirName));
+    await _cacheDir!.create(recursive: true);
+
     final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
     const prefix = 'assets/tts/';
     for (final key in manifest.listAssets()) {
       if (!key.startsWith(prefix)) continue;
       final rel = key.substring(prefix.length);
-      if (!_assetNeededForModel(rel, model)) continue;
-      final dest = File(p.join(base.path, rel));
+      if (!rel.startsWith('espeak-ng-data/')) continue;
+      final dest = File(p.join(_cacheDir!.path, rel));
       if (await dest.exists()) continue;
-      await _writeAssetToCache(key, rel, dest);
+      await dest.parent.create(recursive: true);
+      final bytes = await rootBundle.load(key);
+      final raw = bytes.buffer.asUint8List();
+      if (rel.endsWith('.txt')) {
+        var s = utf8.decode(raw, allowMalformed: false);
+        if (s.startsWith('\uFEFF')) s = s.substring(1);
+        s = s.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+        await dest.writeAsString(s, flush: true);
+      } else {
+        await dest.writeAsBytes(raw);
+      }
     }
-  }
-
-  Future<void> _writeAssetToCache(String assetKey, String rel, File dest) async {
-    await dest.parent.create(recursive: true);
-    final bytes = await rootBundle.load(assetKey);
-    final raw = bytes.buffer.asUint8List();
-    if (rel.endsWith('.txt')) {
-      var s = utf8.decode(raw, allowMalformed: false);
-      if (s.startsWith('\uFEFF')) {
-        s = s.substring(1);
-      }
-      s = s.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
-      await dest.writeAsString(s, flush: true);
-    } else {
-      await dest.writeAsBytes(raw);
-    }
-  }
-
-  Future<void> _copySherpaAssetsOnce(String initialModel) {
-    return Future<void>(() async {
-      final doc = await getApplicationDocumentsDirectory();
-
-      for (final legacyName in [
-        'vault_sherpa_tts',
-        'vault_sherpa_tts_v2',
-        'vault_sherpa_tts_v3',
-        'vault_sherpa_tts_v4',
-        'vault_sherpa_tts_v5',
-        'vault_sherpa_tts_v6',
-        'vault_sherpa_tts_v7',
-        'vault_sherpa_tts_v8',
-      ]) {
-        try {
-          final d = Directory(p.join(doc.path, legacyName));
-          if (await d.exists()) {
-            await d.delete(recursive: true);
-          }
-        } catch (_) {}
-      }
-
-      _cacheDir = Directory(p.join(doc.path, _ttsCacheDirName));
-      await _cacheDir!.create(recursive: true);
-
-      final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
-      const prefix = 'assets/tts/';
-      for (final key in manifest.listAssets()) {
-        if (!key.startsWith(prefix)) continue;
-        final rel = key.substring(prefix.length);
-        if (!_assetNeededForModel(rel, initialModel)) continue;
-        final dest = File(p.join(_cacheDir!.path, rel));
-        if (await dest.exists()) continue;
-        await _writeAssetToCache(key, rel, dest);
-      }
-    });
   }
 
   Future<void> _failIfMissingFile(String absolute, String hint) async {

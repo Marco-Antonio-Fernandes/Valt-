@@ -19,8 +19,10 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_theme.dart';
 import '../models/library_item.dart';
+import '../services/piper_voice_service.dart';
 import '../services/tts_service.dart' show TtsService;
 import '../services/vault_reading_audio.dart';
+import 'voice_manager_screen.dart';
 
 const _kVoicePrefsKey = 'read_aloud_voice_json';
 const _kReadAloudEngine = 'read_aloud_engine';
@@ -110,7 +112,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   var _isGenerating = false;
 
   var _readAloudEngine = 'system';
-  var _sherpaOfflineVoice = 'faber';
+  var _sherpaOfflineVoice = 'pt_br-faber-medium';
 
   bool get isSherpaOffline => _readAloudEngine == 'sherpa' && !kIsWeb;
   String get sherpaVoiceId => _sherpaOfflineVoice;
@@ -153,14 +155,13 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _readAloudEngine = 'system';
     }
     var sv =
-        (p.getString(_kSherpaOfflineVoice) ?? 'faber').toLowerCase().trim();
-    if (sv == 'miro' || sv == 'dii' || sv == 'kokoro') {
-      sv = 'faber';
+        (p.getString(_kSherpaOfflineVoice) ?? '').toLowerCase().trim();
+    if (const {'miro', 'dii', 'kokoro', 'faber', 'cadu'}.contains(sv) ||
+        sv.isEmpty) {
+      sv = 'pt_br-faber-medium';
       await p.setString(_kSherpaOfflineVoice, sv);
     }
-    if (const {'faber', 'cadu'}.contains(sv)) {
-      _sherpaOfflineVoice = sv;
-    }
+    _sherpaOfflineVoice = sv;
     _playbackVolume = (p.getDouble(_kReadAloudVolume) ?? 1.0).clamp(0.0, 1.0);
     _speechRate = (p.getDouble(_kSystemSpeechRate) ?? 0.45).clamp(0.22, 0.92);
     _wavPlaybackSpeed =
@@ -279,7 +280,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   Future<void> selectSherpaVoice(String id) async {
     final normalized = id.toLowerCase().trim();
-    if (!const {'faber', 'cadu'}.contains(normalized)) return;
+    if (normalized.isEmpty) return;
 
     final wasPlaying = _isPlaying;
     if (wasPlaying) {
@@ -1844,6 +1845,20 @@ class _ReadAloudVoiceModalContent extends StatefulWidget {
 
 class _ReadAloudVoiceModalContentState
     extends State<_ReadAloudVoiceModalContent> {
+  Set<String> _downloadedKeys = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDownloaded();
+  }
+
+  Future<void> _loadDownloaded() async {
+    final keys = await PiperVoiceService.instance.downloadedVoiceKeys();
+    if (!mounted) return;
+    setState(() => _downloadedKeys = keys);
+  }
+
   Future<void> _applySystemVoice(Map<String, String> v) async {
     await widget.host.applySystemVoiceFromModal(v);
     if (!mounted) return;
@@ -1870,37 +1885,70 @@ class _ReadAloudVoiceModalContentState
     }
   }
 
+  void _openVoiceManager() {
+    Navigator.of(context).pop();
+    Navigator.of(widget.host.context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const VoiceManagerScreen(),
+      ),
+    );
+  }
+
   Widget _offlineSection() {
     final h = widget.host;
+    final downloaded = _downloadedKeys.toList()..sort();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Vault — offline (Sherpa ONNX)',
-          style: TextStyle(color: AppTheme.muted, fontSize: 12),
-        ),
-        const SizedBox(height: 8),
-        _sherpaTile(
-          id: 'faber',
-          title: 'Faber — PT-BR (VITS/Piper)',
-          selected: h.isSherpaOffline && h.sherpaVoiceId == 'faber',
-        ),
-        _sherpaTile(
-          id: 'cadu',
-          title: 'Cadu — Piper (PT-BR, offline)',
-          selected: h.isSherpaOffline && h.sherpaVoiceId == 'cadu',
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Vault — offline (Sherpa ONNX)',
+                style: TextStyle(color: AppTheme.muted, fontSize: 12),
+              ),
+            ),
+            TextButton.icon(
+              onPressed: _openVoiceManager,
+              icon: const Icon(Icons.download_rounded, size: 16),
+              label: const Text('Gerir vozes', style: TextStyle(fontSize: 12)),
+            ),
+          ],
         ),
         const SizedBox(height: 4),
-        Text(
-          'Faber: assets/tts/Faber/. Cadu: assets/tts/cadu/ (+ tokens.txt ou tokens_cadu.txt). '
-          'Ambos partilham assets/tts/espeak-ng-data.',
-          style: TextStyle(
-            color: AppTheme.ink.withValues(alpha: 0.7),
-            fontSize: 11,
-          ),
-        ),
+        if (downloaded.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              'Nenhuma voz offline instalada. Toque em "Gerir vozes" para baixar.',
+              style: TextStyle(
+                color: AppTheme.ink.withValues(alpha: 0.7),
+                fontSize: 12,
+              ),
+            ),
+          )
+        else
+          for (final key in downloaded)
+            _sherpaTile(
+              id: key,
+              title: _voiceDisplayName(key),
+              selected: h.isSherpaOffline && h.sherpaVoiceId == key,
+            ),
       ],
     );
+  }
+
+  String _voiceDisplayName(String key) {
+    final parts = key.split('-');
+    if (parts.length >= 2) {
+      final speaker = parts[1];
+      final quality = parts.length >= 3 ? parts[2] : '';
+      return '${speaker[0].toUpperCase()}${speaker.substring(1)}'
+          '${quality.isNotEmpty ? ' — $quality' : ''}'
+          ' (offline)';
+    }
+    return key;
   }
 
   Widget _sherpaTile({

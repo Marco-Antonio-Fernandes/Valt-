@@ -1,6 +1,6 @@
 import 'package:path/path.dart' as p;
 
-enum BookFormat { pdf, cbz, cbr }
+enum BookFormat { pdf, cbz, cbr, epub }
 
 class LibraryItem {
   LibraryItem({
@@ -41,6 +41,8 @@ class LibraryItem {
     switch (e) {
       case '.pdf':
         return BookFormat.pdf;
+      case '.epub':
+        return BookFormat.epub;
       case '.cbz':
       case '.zip':
         return BookFormat.cbz;

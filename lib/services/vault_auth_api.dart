@@ -1,9 +1,17 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
 import '../config/vault_backend_config.dart';
 import 'vault_auth_store.dart';
+
+const Duration _kAuthHttpTimeout = Duration(seconds: 25);
+
+Future<http.Response> _withTimeout(Future<http.Response> inner) =>
+    inner.timeout(_kAuthHttpTimeout, onTimeout: () {
+      throw TimeoutException('Servidor não respondeu a tempo (${_kAuthHttpTimeout.inSeconds}s)');
+    });
 
 class VaultAuthApiException implements Exception {
   VaultAuthApiException(this.statusCode, this.message);
@@ -42,15 +50,17 @@ class VaultAuthApi {
     required String password,
     required String displayName,
   }) async {
-    final uri = VaultBackendConfig.uri('/auth/register');
-    final res = await _client.post(
-      uri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'email': email.trim(),
-        'password': password,
-        'display_name': displayName.trim(),
-      }),
+    final uri = VaultBackendConfig.rootUri('/auth/register');
+    final res = await _withTimeout(
+      _client.post(
+        uri,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'email': email.trim(),
+          'password': password,
+          'display_name': displayName.trim(),
+        }),
+      ),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw VaultAuthApiException(res.statusCode, _errorBody(res.body, res.statusCode));
@@ -62,11 +72,13 @@ class VaultAuthApi {
     required String email,
     required String password,
   }) async {
-    final uri = VaultBackendConfig.uri('/auth/login');
-    final res = await _client.post(
-      uri,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'email': email.trim(), 'password': password}),
+    final uri = VaultBackendConfig.rootUri('/auth/login');
+    final res = await _withTimeout(
+      _client.post(
+        uri,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'email': email.trim(), 'password': password}),
+      ),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw VaultAuthApiException(res.statusCode, _errorBody(res.body, res.statusCode));
@@ -75,10 +87,12 @@ class VaultAuthApi {
   }
 
   Future<VaultUser> fetchMe(String token) async {
-    final uri = VaultBackendConfig.uri('/auth/me');
-    final res = await _client.get(
-      uri,
-      headers: {'Authorization': 'Bearer $token'},
+    final uri = VaultBackendConfig.rootUri('/auth/me');
+    final res = await _withTimeout(
+      _client.get(
+        uri,
+        headers: {'Authorization': 'Bearer $token'},
+      ),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw VaultAuthApiException(res.statusCode, _errorBody(res.body, res.statusCode));
@@ -91,12 +105,14 @@ class VaultAuthApi {
     required String displayName,
     required String bio,
   }) async {
-    final uri = VaultBackendConfig.uri('/auth/me');
+    final uri = VaultBackendConfig.rootUri('/auth/me');
     final body = jsonEncode({'display_name': displayName.trim(), 'bio': bio.trim()});
-    final res = await _client.patch(
-      uri,
-      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
-      body: body,
+    final res = await _withTimeout(
+      _client.patch(
+        uri,
+        headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+        body: body,
+      ),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw VaultAuthApiException(res.statusCode, _errorBody(res.body, res.statusCode));

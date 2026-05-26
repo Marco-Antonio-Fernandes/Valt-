@@ -63,7 +63,8 @@ class CoverService {
             if (doc.pages.isEmpty) return null;
             var page = doc.pages[0];
             page = await page.ensureLoaded();
-            const maxW = 320.0;
+            // ~900 px de largura: suficiente para o cartão “Continuar a ler” em ecrãs densos.
+            const maxW = 900.0;
             final fw = page.width;
             final fh = page.height;
             final fullH = fh * maxW / fw;
@@ -72,9 +73,9 @@ class CoverService {
               fullHeight: fullH,
             );
             if (pdfImg == null) return null;
-            final image = pdfImg.createImageNF(pixelSizeThreshold: 420);
+            final image = pdfImg.createImageNF(pixelSizeThreshold: 960);
             pdfImg.dispose();
-            final jpg = im.encodeJpg(image, quality: 82);
+            final jpg = im.encodeJpg(image, quality: 88);
             final out = p.join(dir.path, '${item.id}.jpg');
             await File(out).writeAsBytes(jpg);
             return out;
@@ -97,6 +98,8 @@ class CoverService {
           } finally {
             await src.dispose();
           }
+        case BookFormat.epub:
+          return null;
       }
     } catch (_) {
       return null;

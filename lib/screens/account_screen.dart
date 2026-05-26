@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../app_theme.dart';
@@ -75,6 +77,23 @@ class _AccountScreenState extends State<AccountScreen>
     }
   }
 
+  /// Ligação/partida de rede/timeouts — falha fora do [VaultAuthApiException].
+  String _readableAuthFailure(Object error) {
+    if (error is TimeoutException) {
+      return 'O servidor não respondeu a tempo. Confirma ligação, VPN e URL do servidor (definido em desenvolvimento com --dart-define=VAULT_BACKEND_URL=… ).';
+    }
+    final raw = error.toString();
+    if (raw.contains('SocketException') ||
+        raw.contains('Failed host lookup') ||
+        raw.contains('Connection refused') ||
+        raw.contains('HandshakeException') ||
+        raw.contains('ClientException') ||
+        raw.contains('Network is unreachable')) {
+      return 'Não foi possível ligar ao servidor (rede DNS, servidor desligado ou URL incorreta). Repara o texto “Servidor:” neste ecrã.';
+    }
+    return 'Erro ao contactar o servidor: $raw';
+  }
+
   @override
   void dispose() {
     _guestTabCtrl.dispose();
@@ -109,8 +128,10 @@ class _AccountScreenState extends State<AccountScreen>
         setState(() => _busy = false);
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
       }
-    } catch (_) {
-      if (mounted) setState(() => _busy = false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(_readableAuthFailure(e))));
     }
   }
 
@@ -136,8 +157,10 @@ class _AccountScreenState extends State<AccountScreen>
         setState(() => _busy = false);
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
       }
-    } catch (_) {
-      if (mounted) setState(() => _busy = false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(_readableAuthFailure(e))));
     }
   }
 
@@ -163,8 +186,10 @@ class _AccountScreenState extends State<AccountScreen>
         setState(() => _busy = false);
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
       }
-    } catch (_) {
-      if (mounted) setState(() => _busy = false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(_readableAuthFailure(e))));
     }
   }
 
@@ -184,7 +209,7 @@ class _AccountScreenState extends State<AccountScreen>
   Widget build(BuildContext context) {
     final c = Theme.of(context).colorScheme;
     final logged = (_token ?? '').isNotEmpty && _user != null;
-    final host = VaultBackendConfig.baseUrl;
+    final host = VaultBackendConfig.baseUrl.replaceFirst(RegExp(r'/v1$'), '');
 
     return Scaffold(
       backgroundColor: AppTheme.black,
@@ -208,7 +233,7 @@ class _AccountScreenState extends State<AccountScreen>
               controller: _guestTabCtrl,
               children: [
                 _loginForm(c, host),
-                _registerForm(c),
+                _registerForm(c, host),
               ],
             ),
     );
@@ -243,10 +268,12 @@ class _AccountScreenState extends State<AccountScreen>
     );
   }
 
-  Widget _registerForm(ColorScheme c) {
+  Widget _registerForm(ColorScheme c, String host) {
     return ListView(
       padding: const EdgeInsets.all(22),
       children: [
+        Text('Servidor: $host', style: TextStyle(color: c.onSurfaceVariant, fontSize: 13)),
+        const SizedBox(height: 20),
         TextField(
           controller: _regNameCtrl,
           textCapitalization: TextCapitalization.words,

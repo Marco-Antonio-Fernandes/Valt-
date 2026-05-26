@@ -20,7 +20,6 @@ import '../widgets/local_cover_image.dart';
 import 'comic_reader_screen.dart';
 import 'pdf_reading_mode_screen.dart';
 import 'pdf_reader_screen.dart';
-import 'public_libraries_screen.dart';
 import 'account_screen.dart';
 import 'saga_detail_screen.dart';
 
@@ -44,7 +43,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   int get _boundedTabIndex =>
-      _tabIndex < 0 ? 0 : (_tabIndex > 3 ? 3 : _tabIndex);
+      _tabIndex < 0 ? 0 : (_tabIndex > 2 ? 2 : _tabIndex);
 
   @override
   void dispose() {
@@ -390,7 +389,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       );
     }
 
-    if (openItem.format == BookFormat.pdf) {
+    if (openItem.format == BookFormat.pdf || openItem.format == BookFormat.epub) {
       return PdfReaderScreen(
         item: openItem,
         onPagePersist: persist,
@@ -630,12 +629,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
               selectedIcon: Icon(Icons.menu_book_rounded),
             ),
             NavigationDestination(
-              tooltip: 'Bibliotecas públicas',
-              label: ' ',
-              icon: Icon(Icons.cloud_download_outlined),
-              selectedIcon: Icon(Icons.cloud_download_rounded),
-            ),
-            NavigationDestination(
               tooltip: 'Conta · entrar ou registar',
               label: ' ',
               icon: Icon(Icons.person_outline_rounded),
@@ -816,9 +809,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           ),
                           boxShadow: [
                             BoxShadow(
-                              color: c.primary.withValues(alpha: 0.12),
-                              blurRadius: 40,
-                              offset: const Offset(0, 18),
+                              color: Colors.black.withValues(alpha: 0.35),
+                              blurRadius: 24,
+                              offset: const Offset(0, 12),
+                              spreadRadius: 0,
                             ),
                           ],
                         ),
@@ -832,6 +826,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                 path: coverPath,
                                 fit: BoxFit.cover,
                                 gaplessPlayback: true,
+                                heroBackdropLayout: true,
                                 fallback: _SagaCard._coverFallback(
                                   c,
                                   folder: isPasta,
@@ -865,32 +860,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                     _HomeCircleAction(
                                       icon: Icons.menu_book_rounded,
                                       label: 'Ler',
-                                      gradient: [
-                                        c.primary,
-                                        c.tertiary.withValues(
-                                          alpha: 0.9,
-                                        ),
-                                      ],
+                                      fill: c.primary,
+                                      onFill: c.onPrimary,
                                       onTap: () => _openReader(it),
                                     ),
                                     const SizedBox(width: 16),
                                     _HomeCircleAction(
                                       icon: Icons.record_voice_over_rounded,
                                       label: 'Ouvir',
-                                      gradient:
+                                      fill:
                                           canListen
-                                              ? [
-                                                const Color(0xFF6A1B9A),
-                                                c.primary.withValues(
-                                                  alpha: 0.92,
-                                                ),
-                                              ]
-                                              : [
-                                                c.surfaceContainerHighest,
-                                                c.outline.withValues(
+                                              ? c.primaryContainer
+                                              : c.surfaceContainerHighest,
+                                      onFill:
+                                          canListen
+                                              ? c.onPrimaryContainer
+                                              : c.onSurfaceVariant,
+                                      borderColor:
+                                          canListen
+                                              ? null
+                                              : c.outline.withValues(
                                                   alpha: 0.55,
                                                 ),
-                                              ],
                                       onTap:
                                           () =>
                                               canListen
@@ -1173,33 +1164,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     ),
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(24),
-                      gradient: LinearGradient(
-                        colors: [
-                          c.primary.withValues(alpha: 0.9),
-                          c.tertiary.withValues(alpha: 0.75),
-                        ],
-                      ),
+                      color: c.primary,
                       boxShadow: [
                         BoxShadow(
-                          color: c.primary.withValues(alpha: 0.35),
-                          blurRadius: 18,
-                          offset: const Offset(0, 8),
+                          color: Colors.black.withValues(alpha: 0.28),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
                         ),
                       ],
                     ),
                     child: Row(
                       children: [
-                        const Icon(Icons.add_rounded, color: Colors.white),
+                        Icon(Icons.add_rounded, color: c.onPrimary),
                         const SizedBox(width: 8),
                         Text(
                           'Adicionar',
                           style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                color: Colors.white,
+                                color: c.onPrimary,
                                 fontWeight: FontWeight.w700,
                               ),
                         ),
                         const SizedBox(width: 6),
-                        const Icon(Icons.expand_more_rounded, color: Colors.white),
+                        Icon(Icons.expand_more_rounded, color: c.onPrimary),
                       ],
                     ),
                   ),
@@ -1220,22 +1206,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     DecoratedBox(
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        gradient: LinearGradient(
-                          colors: [
-                            c.primary.withValues(alpha: 0.22),
-                            c.tertiary.withValues(alpha: 0.12),
-                          ],
-                        ),
+                        color: c.surfaceContainerHighest,
                         border: Border.all(
-                          color: c.outline.withValues(alpha: 0.35),
+                          color: c.outline.withValues(alpha: 0.38),
                         ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: c.primary.withValues(alpha: 0.18),
-                            blurRadius: 28,
-                            offset: const Offset(0, 10),
-                          ),
-                        ],
                       ),
                       child: Padding(
                         padding: const EdgeInsets.all(26),
@@ -1336,7 +1310,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
           children: [
             _buildRecentHome(c, sagas),
             _buildLibraryTab(c, sagas),
-            const PublicLibrariesScreen(),
             AccountScreen(authApi: _vaultAuthApi, authStore: _vaultAuthStore),
           ],
         ),
@@ -1350,18 +1323,23 @@ class _HomeCircleAction extends StatelessWidget {
   const _HomeCircleAction({
     required this.icon,
     required this.label,
-    required this.gradient,
+    required this.fill,
+    required this.onFill,
+    this.borderColor,
     required this.onTap,
   });
 
   final IconData icon;
   final String label;
-  final List<Color> gradient;
+  final Color fill;
+  final Color onFill;
+  final Color? borderColor;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
+    final labelInk = Colors.white;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -1373,22 +1351,20 @@ class _HomeCircleAction extends StatelessWidget {
             child: Ink(
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                gradient: LinearGradient(
-                  colors: gradient,
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
+                color: fill,
+                border:
+                    borderColor != null ? Border.all(color: borderColor!) : null,
                 boxShadow: [
                   BoxShadow(
-                    color: gradient.first.withValues(alpha: 0.42),
-                    blurRadius: 22,
-                    offset: const Offset(0, 10),
+                    color: Colors.black.withValues(alpha: 0.25),
+                    blurRadius: 8,
+                    offset: const Offset(0, 3),
                   ),
                 ],
               ),
               child: Padding(
                 padding: const EdgeInsets.all(18),
-                child: Icon(icon, color: Colors.white, size: 34),
+                child: Icon(icon, color: onFill, size: 34),
               ),
             ),
           ),
@@ -1399,12 +1375,12 @@ class _HomeCircleAction extends StatelessWidget {
           style: t.labelLarge?.copyWith(
             fontWeight: FontWeight.w800,
             letterSpacing: -0.15,
-            color: Colors.white,
+            color: labelInk,
             shadows: [
               Shadow(
-                color: Colors.black.withValues(alpha: 0.62),
-                blurRadius: 14,
-                offset: Offset(0, 2),
+                color: Colors.black.withValues(alpha: 0.5),
+                blurRadius: 6,
+                offset: Offset(0, 1),
               ),
             ],
           ),
@@ -1604,41 +1580,19 @@ class _SagaCard extends StatelessWidget {
                             if (onReadAloud != null) ...[
                               Tooltip(
                                 message: 'Modo leitura (voz — só PDF)',
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    gradient: LinearGradient(
-                                      colors: [
-                                        c.primary,
-                                        c.tertiary.withValues(alpha: 0.88),
-                                      ],
-                                      begin: Alignment.topLeft,
-                                      end: Alignment.bottomRight,
-                                    ),
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color:
-                                            c.primary.withValues(alpha: 0.42),
-                                        blurRadius: 14,
-                                        offset: const Offset(0, 7),
-                                      ),
-                                    ],
-                                  ),
-                                  child: Material(
-                                    color: Colors.transparent,
-                                    shape: const CircleBorder(),
-                                    clipBehavior: Clip.antiAlias,
-                                    child: InkWell(
-                                      onTap: onReadAloud,
-                                      splashColor:
-                                          Colors.white.withValues(alpha: 0.22),
-                                      child: const Padding(
-                                        padding: EdgeInsets.all(9),
-                                        child: Icon(
-                                          Icons.record_voice_over_rounded,
-                                          color: Colors.white,
-                                          size: 26,
-                                        ),
+                                child: Material(
+                                  color: c.primaryContainer,
+                                  elevation: 0,
+                                  shape: const CircleBorder(),
+                                  clipBehavior: Clip.antiAlias,
+                                  child: InkWell(
+                                    onTap: onReadAloud,
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(9),
+                                      child: Icon(
+                                        Icons.record_voice_over_rounded,
+                                        color: c.onPrimaryContainer,
+                                        size: 26,
                                       ),
                                     ),
                                   ),
@@ -1722,13 +1676,33 @@ class _SagaCard extends StatelessWidget {
   }
 
   static Widget _coverFallback(ColorScheme c, {bool folder = false}) {
-    return Container(
-      color: c.surfaceContainerHighest,
+    final icon =
+        folder ? Icons.folder_open_rounded : Icons.auto_stories_rounded;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: RadialGradient(
+          center: const Alignment(-0.25, -0.45),
+          radius: 1.15,
+          colors: [
+            c.primary.withValues(alpha: folder ? 0.14 : 0.24),
+            c.surfaceContainerHigh,
+          ],
+        ),
+      ),
       child: Center(
         child: Icon(
-          folder ? Icons.folder_open_rounded : Icons.auto_stories_rounded,
-          size: 48,
-          color: c.onSurfaceVariant.withValues(alpha: 0.4),
+          icon,
+          size: 58,
+          color: folder
+              ? c.tertiary.withValues(alpha: 0.9)
+              : c.primary.withValues(alpha: 0.95),
+          shadows: [
+            Shadow(
+              color: Colors.black.withValues(alpha: 0.42),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
         ),
       ),
     );

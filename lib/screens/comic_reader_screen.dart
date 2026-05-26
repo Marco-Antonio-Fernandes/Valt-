@@ -81,7 +81,23 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> {
     if (s == null) {
       return Future.error(StateError('no source'));
     }
+    _prefetchAround(i);
     return _futures.putIfAbsent(i, () => s.pageAt(i));
+  }
+
+  void _prefetchAround(int center) {
+    final s = _source;
+    if (s == null) return;
+    for (var d = 1; d <= 3; d++) {
+      final next = center + d;
+      final prev = center - d;
+      if (next < s.pageCount) {
+        _futures.putIfAbsent(next, () => s.pageAt(next));
+      }
+      if (prev >= 0) {
+        _futures.putIfAbsent(prev, () => s.pageAt(prev));
+      }
+    }
   }
 
   @override

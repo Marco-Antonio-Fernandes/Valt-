@@ -2,7 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show compute, kIsWeb;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:rar/rar.dart';
@@ -95,38 +95,40 @@ class ComicOpenError implements Exception {
 // ──────────────────────── ZIP ────────────────────────
 
 class ComicPageSourceZip extends ComicPageSource {
-  ComicPageSourceZip._(this._files);
+  ComicPageSourceZip._(this._pages);
 
-  final List<ArchiveFile> _files;
+  final List<Uint8List> _pages;
 
   static Future<ComicPageSourceZip> fromFile(String path) async {
     final bytes = await File(path).readAsBytes();
+    final pages = await compute(_decodeZipImages, bytes);
+    if (pages.isEmpty) {
+      throw StateError('Nenhuma imagem no arquivo ZIP');
+    }
+    return ComicPageSourceZip._(pages);
+  }
+
+  static List<Uint8List> _decodeZipImages(Uint8List bytes) {
     final arch = ZipDecoder().decodeBytes(bytes);
-    final images = <ArchiveFile>[];
+    final entries = <(String, Uint8List)>[];
     for (final f in arch.files) {
       if (!f.isFile) continue;
       if (isImagePathName(f.name)) {
-        images.add(f);
+        final data = f.readBytes();
+        if (data != null && data.isNotEmpty) {
+          entries.add((f.name.toLowerCase(), data));
+        }
       }
     }
-    images.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-    if (images.isEmpty) {
-      throw StateError('Nenhuma imagem no arquivo ZIP');
-    }
-    return ComicPageSourceZip._(images);
+    entries.sort((a, b) => a.$1.compareTo(b.$1));
+    return entries.map((e) => e.$2).toList();
   }
 
   @override
-  int get pageCount => _files.length;
+  int get pageCount => _pages.length;
 
   @override
-  Future<Uint8List> pageAt(int index) async {
-    final c = _files[index].readBytes();
-    if (c == null || c.isEmpty) {
-      throw StateError('Falha ao ler página $index');
-    }
-    return c;
-  }
+  Future<Uint8List> pageAt(int index) async => _pages[index];
 
   @override
   Future<void> dispose() async {}
@@ -135,44 +137,43 @@ class ComicPageSourceZip extends ComicPageSource {
 // ──────────────────────── TAR ────────────────────────
 
 class ComicPageSourceTar extends ComicPageSource {
-  ComicPageSourceTar._(this._entries);
+  ComicPageSourceTar._(this._pages);
 
-  final List<_TarEntry> _entries;
+  final List<Uint8List> _pages;
 
   static Future<ComicPageSourceTar> fromFile(String path) async {
     final bytes = await File(path).readAsBytes();
+    final pages = await compute(_decodeTarImages, bytes);
+    if (pages.isEmpty) {
+      throw StateError('Nenhuma imagem no arquivo TAR');
+    }
+    return ComicPageSourceTar._(pages);
+  }
+
+  static List<Uint8List> _decodeTarImages(Uint8List bytes) {
     final arch = TarDecoder().decodeBytes(bytes);
-    final images = <_TarEntry>[];
+    final entries = <(String, Uint8List)>[];
     for (final f in arch.files) {
       if (!f.isFile) continue;
       if (isImagePathName(f.name)) {
         final data = f.readBytes();
         if (data != null && data.isNotEmpty) {
-          images.add(_TarEntry(f.name, data));
+          entries.add((f.name.toLowerCase(), data));
         }
       }
     }
-    images.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
-    if (images.isEmpty) {
-      throw StateError('Nenhuma imagem no arquivo TAR');
-    }
-    return ComicPageSourceTar._(images);
+    entries.sort((a, b) => a.$1.compareTo(b.$1));
+    return entries.map((e) => e.$2).toList();
   }
 
   @override
-  int get pageCount => _entries.length;
+  int get pageCount => _pages.length;
 
   @override
-  Future<Uint8List> pageAt(int index) async => _entries[index].data;
+  Future<Uint8List> pageAt(int index) async => _pages[index];
 
   @override
   Future<void> dispose() async {}
-}
-
-class _TarEntry {
-  _TarEntry(this.name, this.data);
-  final String name;
-  final Uint8List data;
 }
 
 // ──────────────── 7z / UnRAR nativo ─────────────────
@@ -187,7 +188,11 @@ class ComicPageSourceNative extends ComicPageSource {
     final tmp = await getTemporaryDirectory();
     final base = p.join(tmp.path, 'cbr_cache', id);
     final dir = Directory(base);
+
+    // Reutiliza cache se já tiver sido extraído antes
     if (dir.existsSync()) {
+      final cached = await _collectImages(dir);
+      if (cached.isNotEmpty) return ComicPageSourceNative._(cached);
       await dir.delete(recursive: true);
     }
     await dir.create(recursive: true);
@@ -197,22 +202,23 @@ class ComicPageSourceNative extends ComicPageSource {
       throw StateError('Native falhou: ${result.detail}');
     }
 
-    final all = <String>[];
-    await for (final e in dir.list(recursive: true, followLinks: false)) {
-      if (e is! File) continue;
-      if (isImagePathName(e.path)) {
-        all.add(e.path);
-      }
-    }
-    all.sort(
-      (a, b) => p.basename(a).toLowerCase().compareTo(
-            p.basename(b).toLowerCase(),
-          ),
-    );
+    final all = await _collectImages(dir);
     if (all.isEmpty) {
       throw StateError('Native extraiu mas 0 imagens encontradas');
     }
     return ComicPageSourceNative._(all);
+  }
+
+  static Future<List<String>> _collectImages(Directory dir) async {
+    final all = <String>[];
+    await for (final e in dir.list(recursive: true, followLinks: false)) {
+      if (e is! File) continue;
+      if (isImagePathName(e.path)) all.add(e.path);
+    }
+    all.sort(
+      (a, b) => p.basename(a).toLowerCase().compareTo(p.basename(b).toLowerCase()),
+    );
+    return all;
   }
 
   @override
@@ -238,7 +244,10 @@ class ComicPageSourceRarPlugin extends ComicPageSource {
     final tmp = await getTemporaryDirectory();
     final base = p.join(tmp.path, 'cbr_cache', id);
     final dir = Directory(base);
+
     if (dir.existsSync()) {
+      final cached = await ComicPageSourceNative._collectImages(dir);
+      if (cached.isNotEmpty) return ComicPageSourceRarPlugin._(cached);
       await dir.delete(recursive: true);
     }
     await dir.create(recursive: true);
