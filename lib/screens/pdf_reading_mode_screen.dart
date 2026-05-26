@@ -1942,11 +1942,13 @@ class _ReadAloudVoiceModalContentState
   String _voiceDisplayName(String key) {
     final parts = key.split('-');
     if (parts.length >= 2) {
-      final speaker = parts[1];
+      final speaker = parts[1].trim();
       final quality = parts.length >= 3 ? parts[2] : '';
-      return '${speaker[0].toUpperCase()}${speaker.substring(1)}'
-          '${quality.isNotEmpty ? ' — $quality' : ''}'
-          ' (offline)';
+      if (speaker.isEmpty) return '$key (offline)';
+      final head = speaker.length == 1
+          ? speaker.toUpperCase()
+          : '${speaker[0].toUpperCase()}${speaker.substring(1)}';
+      return '$head${quality.isNotEmpty ? ' — $quality' : ''} (offline)';
     }
     return key;
   }

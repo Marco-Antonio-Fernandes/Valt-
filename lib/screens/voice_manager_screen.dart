@@ -240,19 +240,24 @@ class _VoiceManagerScreenState extends State<VoiceManagerScreen> {
         itemBuilder: (ctx, i) {
           final lang = _langFamilies[i];
           final selected = lang == _selectedLang;
-          return FilterChip(
+          // ChoiceChip (não FilterChip): só um idioma ativo; avoid onSelected(false)
+          // com estado desatualizado ao retocar o mesmo chip (podia encerrar/assert).
+          return ChoiceChip(
             label: Text(lang.toUpperCase()),
             selected: selected,
-            onSelected: (_) => setState(() => _selectedLang = lang),
+            onSelected: (bool value) {
+              if (!mounted || !value) return;
+              setState(() => _selectedLang = lang);
+            },
             selectedColor: cs.primaryContainer,
-            checkmarkColor: cs.onPrimaryContainer,
             labelStyle: TextStyle(
               color: selected ? cs.onPrimaryContainer : cs.onSurfaceVariant,
               fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
               fontSize: 13,
             ),
             side: BorderSide(
-              color: selected ? cs.primary.withValues(alpha: 0.5) : cs.outline.withValues(alpha: 0.3),
+              color:
+                  selected ? cs.primary.withValues(alpha: 0.5) : cs.outline.withValues(alpha: 0.3),
             ),
             padding: const EdgeInsets.symmetric(horizontal: 4),
           );

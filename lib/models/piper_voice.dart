@@ -39,8 +39,14 @@ class PiperVoice {
 
   /// Estimated display name: "Speaker — quality".
   String get displayName {
-    final spk = name.isNotEmpty ? name : key.split('-').elementAtOrNull(1) ?? key;
-    return '${spk[0].toUpperCase()}${spk.substring(1)} — $quality';
+    final rawSpeaker =
+        name.isNotEmpty ? name : key.split('-').elementAtOrNull(1);
+    var spk =
+        (rawSpeaker != null && rawSpeaker.isNotEmpty) ? rawSpeaker : key.trim();
+    if (spk.isEmpty) return '$key · $quality'.trim();
+    final title =
+        spk.length == 1 ? spk.toUpperCase() : '${spk[0].toUpperCase()}${spk.substring(1)}';
+    return '$title — $quality';
   }
 
   factory PiperVoice.fromJson(Map<String, dynamic> json) {
