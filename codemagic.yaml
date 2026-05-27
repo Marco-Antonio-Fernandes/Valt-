@@ -1,0 +1,27 @@
+workflows:
+  ios-debug-unsigned:
+    name: iOS Debug IPA (sem code signing)
+    instance_type: mac_mini_m1
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+    scripts:
+      - name: Build iOS Debug sem assinatura
+        script: |
+          set -e
+          flutter pub get
+          flutter build ios --debug --no-codesign
+      - name: Empacotar Payload em Valt-Debug.ipa
+        script: |
+          set -e
+          ROOT="${CM_BUILD_DIR:-$PWD}"
+          IOS_APP="$ROOT/build/ios/iphoneos"
+          cd "$IOS_APP"
+          rm -rf Payload
+          mkdir Payload
+          cp -R Runner.app Payload/
+          rm -f "$ROOT/Valt-Debug.ipa"
+          zip -r "$ROOT/Valt-Debug.ipa" Payload
+    artifacts:
+      - Valt-Debug.ipa

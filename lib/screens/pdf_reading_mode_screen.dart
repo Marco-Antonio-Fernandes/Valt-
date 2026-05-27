@@ -119,6 +119,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   var _playbackVolume = 1.0;
   var _pendingBackChunk = false;
+  /// Próximo trecho (media / comando) durante TTS sistema — pedido de avançar sem repetir áudio atual.
+  var _pendingSkipForwardChunk = false;
   int? _pendingJumpChunk;
   var _isGenerating = false;
 
@@ -330,6 +332,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   void _seekNextSegment() {
     if (!_isPlaying) return;
+    if (_chunkIndex >= _queue.length - 1) return;
+    _pendingSkipForwardChunk = true;
     _interruptChunkPlayback();
   }
 
@@ -364,6 +368,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
     _clearQueuedPlaybackState();
     _chunkIndex = 0;
+    _pendingSkipForwardChunk = false;
   }
 
   Future<void> applySystemVoiceFromModal(Map<String, String> v) async {
@@ -386,6 +391,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _detachSherpaWavProgressListener();
     _clearQueuedPlaybackState();
     _chunkIndex = 0;
+    _pendingSkipForwardChunk = false;
   }
 
   Future<void> _migrateLegacyReadAloudPrefs() async {
@@ -481,6 +487,18 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _currentPage - 1,
       totalPages: _totalPages,
     );
+  }
+
+  /// Mantém página visível = página da leitura; evita novo Play recarregar fila desde página antiga.
+  Future<void> _syncViewerToReadingPage(int pageNum) async {
+    if (!mounted || pageNum < 1) return;
+    if (_totalPages != null && pageNum > _totalPages!) return;
+    if (pageNum == _currentPage) return;
+    setState(() => _currentPage = pageNum);
+    if (!_pdfController.isReady) return;
+    try {
+      await _pdfController.goToPage(pageNumber: pageNum);
+    } catch (_) {}
   }
 
   /// Ao sair do ecrã: preferir o segmento da fila se existir leitura recente,
@@ -1450,6 +1468,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   Future<void> _speakNormalizedChunkWithPauseResume(String normalizedText) async {
     var attempts = 0;
     while (mounted && _isPlaying && attempts < 16) {
+      if (_pendingSkipForwardChunk) return;
       attempts++;
       var utteranceNaturallyCompleted = false;
       _tts.setCompletionHandler(() {
@@ -1464,7 +1483,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
       if (!mounted || !_isPlaying) return;
 
-      await Future<void>.delayed(const Duration(milliseconds: 28));
+      /// Sem pausa aqui — apenas ceder ciclo ao motor (silêncios entre págs. ficam só no próprio texto).
+      if (!_pendingSkipForwardChunk) {
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      if (_pendingSkipForwardChunk) return;
 
       final completed = utteranceNaturallyCompleted;
 
@@ -1496,6 +1520,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
         final g0 = _readingPrefetchGeneration;
         final c = _queue[_chunkIndex];
+        if (!mounted || !_isPlaying) break;
+
+        await _syncViewerToReadingPage(c.page);
         if (!mounted || !_isPlaying) break;
 
         if (mounted) {
@@ -1593,6 +1620,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
           _clearSherpaPrefetchFutures();
           _chunkIndex = _pendingJumpChunk!;
           _pendingJumpChunk = null;
+          _pendingSkipForwardChunk = false;
           continue;
         }
 
@@ -1601,6 +1629,16 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
           _clearSherpaPrefetchFutures();
           _chunkIndex = max(0, _chunkIndex - 1);
           _pendingBackChunk = false;
+          _pendingSkipForwardChunk = false;
+          continue;
+        }
+
+        if (_pendingSkipForwardChunk) {
+          _bumpReadingPrefetchGen();
+          _clearSherpaPrefetchFutures();
+          _pendingSkipForwardChunk = false;
+          widget.onPagePersist?.call(c.page - 1, totalPages: _totalPages);
+          _chunkIndex++;
           continue;
         }
 
@@ -1660,14 +1698,27 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   Future<void> _startPlayingFromOffset(int charOffset) async {
     await _fillQueue();
+    var foundExact = false;
     for (var i = 0; i < _queue.length; i++) {
       final c = _queue[i];
       if (c.page != _currentPage) continue;
       if (charOffset >= c.offsetInPage &&
           charOffset < c.offsetInPage + c.text.length) {
         _chunkIndex = i;
+        foundExact = true;
         break;
       }
+    }
+    if (!foundExact) {
+      var anyOnPage = false;
+      for (var i = 0; i < _queue.length; i++) {
+        if (_queue[i].page == _currentPage) {
+          _chunkIndex = i;
+          anyOnPage = true;
+          break;
+        }
+      }
+      if (!anyOnPage) _chunkIndex = 0;
     }
     if (!mounted) return;
 
@@ -1690,6 +1741,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _clearSherpaPrefetchFutures();
     _isPlaying = false;
     _pendingBackChunk = false;
+    _pendingSkipForwardChunk = false;
     _pendingJumpChunk = null;
     _wavScrubbingSherpa = false;
     _wavChunkPos = null;
