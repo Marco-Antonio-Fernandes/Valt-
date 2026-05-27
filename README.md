@@ -11,6 +11,22 @@ Na app Flutter, aponta o URL do API com `--dart-define=VAULT_BACKEND_URL=https:/
 
 Instruções de arranque: `..\valt-catalog-api\README.md` (mesmo nível deste projeto na pasta Projetos).
 
+### Apagar conta
+
+A app chama **`DELETE`** `{backend}/auth/me` com o Bearer token da sessão; opcionalmente envia **`{"password":"…"}`** no corpo (confirmação no ecrã). O backend deve implementar esse endpoint para apagar o utilizador (e referências ligadas — cascata segundo a política) na base de dados.
+
+Exemplo minimal (FastAPI + SQLAlchemy, adapta ao teu router de auth):
+
+```python
+@router.delete("/me")
+async def delete_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    db.delete(current_user)
+    db.commit()
+    return Response(status_code=204)
+```
+
+Se quiseres validar a palavra-passe (`body` JSON opcional), faz `password: str | None` via `Body(embed=True)` ou modelo Pydantic e compara hash antes de `db.delete`.
+
 Se ainda vires **`Valt-\server`** no disco antigo é uma pasta vazia ou bloqueada; podes apagá‑la manualmente (fecha IDE/terminal que esteja a abrir essa pasta).
 
 ## Modo leitura (PDF + voz)

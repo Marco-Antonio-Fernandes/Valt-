@@ -100,6 +100,38 @@ class VaultAuthApi {
     return VaultUser.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
   }
 
+  /// Remove a conta do utilizador actual no servidor (registo na base de dados).
+  ///
+  /// Contrato esperado no API: **`DELETE /auth/me`** com `Authorization: Bearer <token>`.
+  /// Corpo JSON opcional `{"password":"<palavra-passe>"}` se o backend validar a palavra-passe antes de apagar.
+  Future<void> deleteAccount({
+    required String token,
+    String? confirmationPassword,
+  }) async {
+    final uri = VaultBackendConfig.rootUri('/auth/me');
+    final hasPw =
+        confirmationPassword != null &&
+        confirmationPassword.isNotEmpty;
+    final res = await _withTimeout(
+      _client.delete(
+        uri,
+        headers: {
+          'Authorization': 'Bearer $token',
+          if (hasPw) 'Content-Type': 'application/json',
+        },
+        body: hasPw
+            ? jsonEncode({'password': confirmationPassword})
+            : null,
+      ),
+    );
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw VaultAuthApiException(
+        res.statusCode,
+        _errorBody(res.body, res.statusCode),
+      );
+    }
+  }
+
   Future<VaultUser> updateProfile({
     required String token,
     required String displayName,

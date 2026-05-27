@@ -7,6 +7,11 @@
 /// ### Produção
 /// `https://valt.rotatix.com.br`
 ///
+/// ### Apagar conta
+///
+/// `DELETE /auth/me` + `Authorization: Bearer …` — deve remover o utilizador na base de dados.
+/// A app pode enviar corpo `{"password":"…"}` se o servidor validar a palavra-passe.
+///
 /// ### Desenvolvimento local
 /// `flutter run --dart-define=VAULT_BACKEND_URL=http://127.0.0.1:8080`
 ///

@@ -38,6 +38,7 @@ class _AccountScreenState extends State<AccountScreen>
 
   final _profNameCtrl = TextEditingController();
   final _profBioCtrl = TextEditingController();
+  final _deletePwCtrl = TextEditingController();
 
   @override
   void initState() {
@@ -104,6 +105,7 @@ class _AccountScreenState extends State<AccountScreen>
     _regNameCtrl.dispose();
     _profNameCtrl.dispose();
     _profBioCtrl.dispose();
+    _deletePwCtrl.dispose();
     super.dispose();
   }
 
@@ -203,6 +205,110 @@ class _AccountScreenState extends State<AccountScreen>
     _profNameCtrl.clear();
     _profBioCtrl.clear();
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saíste da conta.')));
+  }
+
+  Future<void> _deleteAccountFlow() async {
+    final t = _token;
+    if (t == null || !mounted) return;
+    _deletePwCtrl.clear();
+
+    final pwd = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.black,
+        title: const Text('Apagar conta?'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'A conta será eliminada no servidor (base de dados). '
+                'Os comics ou PDFs guardados só neste dispositivo não são apagados.',
+                style: TextStyle(
+                  color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _deletePwCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Palavra-passe para confirmar',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            onPressed: () {
+              final p = _deletePwCtrl.text;
+              if (p.isEmpty) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(
+                    behavior: SnackBarBehavior.floating,
+                    content:
+                        Text('Introduz a palavra-passe para confirmar a eliminação.'),
+                  ),
+                );
+                return;
+              }
+              Navigator.pop(ctx, p);
+            },
+            child: const Text('Apagar conta'),
+          ),
+        ],
+      ),
+    );
+
+    if (pwd == null || pwd.isEmpty || !mounted) return;
+
+    setState(() => _busy = true);
+    try {
+      await widget.authApi.deleteAccount(
+        token: t,
+        confirmationPassword: pwd,
+      );
+      await widget.authStore.clearSession();
+      if (!mounted) return;
+      setState(() {
+        _token = null;
+        _user = null;
+        _busy = false;
+      });
+      _profNameCtrl.clear();
+      _profBioCtrl.clear();
+      _deletePwCtrl.clear();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('Conta eliminada no servidor.'),
+        ),
+      );
+      Navigator.of(context).pop();
+    } on VaultAuthApiException catch (e) {
+      if (mounted) {
+        setState(() => _busy = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message)),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_readableAuthFailure(e))),
+      );
+    }
   }
 
   @override
@@ -342,6 +448,33 @@ class _AccountScreenState extends State<AccountScreen>
               ),
             ),
           ],
+        ),
+        const SizedBox(height: 28),
+        Divider(color: c.outlineVariant.withValues(alpha: 0.6)),
+        const SizedBox(height: 12),
+        Text(
+          'Eliminar conta',
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: c.error,
+                fontWeight: FontWeight.w700,
+              ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Pedido irreversível no servidor onde tens sessão iniciada.',
+          style: TextStyle(color: c.onSurfaceVariant, fontSize: 12),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton(
+            style: OutlinedButton.styleFrom(
+              foregroundColor: c.error,
+              side: BorderSide(color: c.error.withValues(alpha: 0.85)),
+            ),
+            onPressed: _busy ? null : _deleteAccountFlow,
+            child: const Text('Apagar conta no servidor'),
+          ),
         ),
       ],
     );
