@@ -75,9 +75,7 @@ class DownloadCompleteNotifier {
               ),
             );
       }
-    } catch (e, st) {
-      debugPrint('DownloadCompleteNotifier init: $e\n$st');
-    }
+    } catch (_) {}
   }
 
   Future<void> _requestDarwinIfNeeded() async {
@@ -97,9 +95,7 @@ class DownloadCompleteNotifier {
                 MacOSFlutterLocalNotificationsPlugin>()
             ?.requestPermissions(alert: true, badge: true, sound: true);
       }
-    } catch (e) {
-      debugPrint('DownloadCompleteNotifier permissions: $e');
-    }
+    } catch (_) {}
   }
 
   Future<void> notifyDownloadComplete(String fileLabel) async {
@@ -138,9 +134,7 @@ class DownloadCompleteNotifier {
           ),
         ),
       );
-    } catch (e, st) {
-      debugPrint('DownloadCompleteNotifier show: $e\n$st');
-    }
+    } catch (_) {}
   }
 
   static String _truncate(String s, int max) {

@@ -5,12 +5,7 @@ import 'dart:math' show max, min;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
-    show
-        TargetPlatform,
-        debugPrint,
-        debugPrintStack,
-        defaultTargetPlatform,
-        kIsWeb;
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:pdfrx/pdfrx.dart';
@@ -19,9 +14,16 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_theme.dart';
 import '../models/library_item.dart';
+import '../models/reading_book_annotations.dart';
+import '../models/reading_highlight.dart';
+import '../models/reading_note.dart';
 import '../services/piper_voice_service.dart';
+import '../services/reading_notes_store.dart';
 import '../services/tts_service.dart' show TtsService;
 import '../services/vault_reading_audio.dart';
+import '../widgets/pdf_sticky_notes.dart';
+import '../widgets/reading_highlight_color_sheet.dart';
+import '../widgets/reading_highlights_paint.dart';
 import 'voice_manager_screen.dart';
 
 const _kVoicePrefsKey = 'read_aloud_voice_json';
@@ -32,6 +34,10 @@ const _kSystemSpeechRate = 'read_aloud_system_speech_rate';
 const _kWavPlaybackSpeed = 'read_aloud_wav_playback_speed';
 const _defaultVoiceLocale = 'pt-BR';
 const _readHighlightFill = Color(0x991565C0);
+/// Sherpa WAV emite ticks densos — limitar repaint do PDF/evitar setState a cada um.
+const _kSherpaPdfProgressMinRedrawMs = 130;
+/// Com leitura parada liberta `PdfPageText` longe da página atual (exceto grifos / vizinhas).
+const _kStructuredTextCacheNearbyPages = 2;
 
 class PdfReadingModeScreen extends StatefulWidget {
   const PdfReadingModeScreen({
@@ -49,6 +55,7 @@ class PdfReadingModeScreen extends StatefulWidget {
 
 class _Chunk {
   const _Chunk(this.page, this.text, this.offsetInPage);
+
   final int page;
   final String text;
   final int offsetInPage;
@@ -78,6 +85,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   final List<_Chunk> _queue = [];
   /// Texto por página (índices alinhados com [PdfPageText] para destaque no PDF).
   final Map<int, String> _pageTextFromQueue = {};
+  /// Páginas já ingestadas na fila (extensão é incremental ao ler — não todas de uma vez).
+  final Set<int> _pagesMaterializedIntoQueue = {};
   final Map<int, PdfPageText> _structuredByPage = {};
   int _chunkIndex = 0;
   /// Invalida pré-cálculo Sherpa em stop/skip — o futuro descarta o WAV órfão.
@@ -90,6 +99,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   PdfPageTextRange? _readHighlight;
   /// Evita redesenhar o PDF demasiadas vezes durante o FlutterTts (economiza CPU/GPU).
   DateTime? _lastProgressRedraw;
+  /// Idem durante progresso WAV (Sherpa — ticks muito frequentes).
+  DateTime? _lastWavHighlightRedraw;
 
   StreamSubscription<void>? _vaultAudioStopSub;
   StreamSubscription<VaultReadingSegmentSkip>? _vaultSegmentSkipSub;
@@ -110,6 +121,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   var _pendingBackChunk = false;
   int? _pendingJumpChunk;
   var _isGenerating = false;
+
+  final ReadingNotesStore _readingNotesStore = ReadingNotesStore();
+  List<ReadingNote> _readingNotes = [];
+  List<ReadingHighlight> _readingHighlights = [];
+  var _awaitingStickyLineTap = false;
+  final GlobalKey _stickyStackLayerKey = GlobalKey();
 
   var _readAloudEngine = 'system';
   var _sherpaOfflineVoice = 'pt_br-faber-medium';
@@ -138,6 +155,30 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       }
     });
     unawaited(_bootstrapTts());
+    unawaited(_reloadReadingNotesForItem());
+  }
+
+  Future<void> _reloadReadingNotesForItem() async {
+    try {
+      final data = await _readingNotesStore.book(widget.item.id);
+      if (!mounted) return;
+      setState(() {
+        _readingNotes = List<ReadingNote>.from(data.notes);
+        _readingHighlights = List<ReadingHighlight>.from(data.highlights);
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _persistReadingNotes() async {
+    try {
+      await _readingNotesStore.saveAnnotationsForBook(
+        widget.item.id,
+        ReadingBookAnnotations(
+          notes: List<ReadingNote>.from(_readingNotes),
+          highlights: List<ReadingHighlight>.from(_readingHighlights),
+        ),
+      );
+    } catch (_) {}
   }
 
   @override
@@ -204,24 +245,38 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       if (!mounted || !isSherpaOffline || !_isPlaying || _paused) return;
       final pos = tick.$1;
       final d = tick.$2;
-      setState(() {
-        _wavChunkPos = pos;
-        if (d != null && d.inMilliseconds > 0) {
-          _wavChunkDur = d;
-        }
-        if (!_wavScrubbingSherpa &&
-            _queue.isNotEmpty &&
-            _chunkIndex < _queue.length) {
-          final dm = (_wavChunkDur ?? Duration.zero).inMilliseconds;
-          final tAudio = dm <= 0
-              ? 0.0
-              : (pos.inMilliseconds / dm).clamp(0.0, 1.0);
-          _applyReadHighlightChunkProgress(_queue[_chunkIndex], tAudio);
-        }
+
+      final now = DateTime.now();
+      bool heavyRedraw = true;
+      if (_lastWavHighlightRedraw != null &&
+          now.difference(_lastWavHighlightRedraw!).inMilliseconds <
+              _kSherpaPdfProgressMinRedrawMs) {
+        heavyRedraw = false;
+      }
+
+      _wavChunkPos = pos;
+      if (d != null && d.inMilliseconds > 0) {
+        _wavChunkDur = d;
+      }
+
+      if (heavyRedraw) {
+        _lastWavHighlightRedraw = now;
+        if (!mounted) return;
+        setState(() {
+          if (!_wavScrubbingSherpa &&
+              _queue.isNotEmpty &&
+              _chunkIndex < _queue.length) {
+            final dm = (_wavChunkDur ?? Duration.zero).inMilliseconds;
+            final tAudio = dm <= 0
+                ? 0.0
+                : (pos.inMilliseconds / dm).clamp(0.0, 1.0);
+            _applyReadHighlightChunkProgress(_queue[_chunkIndex], tAudio);
+          }
+        });
         if (_pdfController.isReady) {
           _pdfController.invalidate();
         }
-      });
+      }
     });
   }
 
@@ -307,8 +362,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _sherpaOfflineVoice = normalized;
     });
 
-    _queue.clear();
-    _pageTextFromQueue.clear();
+    _clearQueuedPlaybackState();
     _chunkIndex = 0;
   }
 
@@ -330,8 +384,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _readAloudEngine = 'system';
     });
     _detachSherpaWavProgressListener();
-    _queue.clear();
-    _pageTextFromQueue.clear();
+    _clearQueuedPlaybackState();
     _chunkIndex = 0;
   }
 
@@ -514,6 +567,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   void _clearHighlight() {
     _lastProgressRedraw = null;
+    _lastWavHighlightRedraw = null;
     _flutterWordProgress = 0;
     _readHighlight = null;
     if (_pdfController.isReady) {
@@ -555,6 +609,98 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     return raw.replaceAll(RegExp(r'\r\n'), '\n').trim();
   }
 
+  static int _footnoteLeadingSkipForRaw(String raw) {
+    final crlf = raw.replaceAll(RegExp(r'\r\n'), '\n');
+    return RegExp(r'^\s*').firstMatch(crlf)?.group(0)?.length ?? 0;
+  }
+
+  /// Índice no texto retornado por [_preparePageSourceText].
+  static int linkedPrepCharFromRawTap(PdfPageText structured, int rawCharTap) {
+    final prepared = _preparePageSourceText(structured.fullText);
+    if (prepared.isEmpty) return 0;
+    final raw = structured.fullText.replaceAll(RegExp(r'\r\n'), '\n');
+    final skip = _footnoteLeadingSkipForRaw(structured.fullText);
+    var ri = rawCharTap.clamp(0, max(0, raw.length - 1));
+    if (ri < skip) ri = skip;
+    final inside = ri - skip;
+    return inside.clamp(0, prepared.length - 1).toInt();
+  }
+
+  /// Inverso simplificado de [linkedPrepCharFromRawTap]: `prepared.trim ≈ raw[skip+]` só perde `\s` nos extremos.
+  static int? _rawCharIndexForLinkedPrep(PdfPageText structured, int prepIdx) {
+    final prepared = _preparePageSourceText(structured.fullText);
+    if (structured.charRects.isEmpty ||
+        prepared.isEmpty ||
+        prepIdx < 0 ||
+        prepIdx >= prepared.length) {
+      return null;
+    }
+    final skip = _footnoteLeadingSkipForRaw(structured.fullText);
+    final ri = skip + prepIdx;
+    return ri.clamp(0, structured.charRects.length - 1).toInt();
+  }
+
+  Offset _normalizedStickyAnchorFromRaw(
+    PdfPageText structured,
+    int pageNum,
+    int rawCharIndex,
+  ) {
+    if (!_pdfController.isReady) {
+      return Offset.zero;
+    }
+    final layouts = _pdfController.layout.pageLayouts;
+    if (pageNum < 1 ||
+        pageNum > layouts.length ||
+        rawCharIndex < 0 ||
+        rawCharIndex >= structured.charRects.length) {
+      return Offset.zero;
+    }
+    final pageRect = layouts[pageNum - 1];
+    final page = _pdfController.pages[pageNum - 1];
+    final pdfRect = structured.charRects[rawCharIndex];
+    final r = pdfRect.toRectInDocument(page: page, pageRect: pageRect);
+    final local = _pdfController.documentToLocal(r.center);
+    final box =
+        _stickyStackLayerKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || box.hasSize == false) {
+      return Offset.zero;
+    }
+    final w = box.size.width;
+    final h = box.size.height;
+    if (w <= 0 || h <= 0) return Offset.zero;
+    return Offset(
+      (local.dx / w).clamp(0.06, 0.94),
+      (local.dy / h).clamp(0.06, 0.93),
+    );
+  }
+
+  Offset _stickyResolvedNorm(ReadingNote n) {
+    if (n.pageNumber != _currentPage) {
+      return Offset(n.anchorX, n.anchorY);
+    }
+    final structured = _structuredByPage[n.pageNumber];
+    final prep = n.linkedPrepCharIndex;
+    if (structured == null || prep == null) {
+      return Offset(n.anchorX, n.anchorY);
+    }
+    final prepared = _preparePageSourceText(structured.fullText);
+    if (prep < 0 || prep >= prepared.length) {
+      return Offset(n.anchorX, n.anchorY);
+    }
+    final rawIdx = _rawCharIndexForLinkedPrep(structured, prep);
+    if (rawIdx == null) return Offset(n.anchorX, n.anchorY);
+    final norm =
+        _normalizedStickyAnchorFromRaw(structured, n.pageNumber, rawIdx);
+    if (norm == Offset.zero) {
+      return Offset(n.anchorX, n.anchorY);
+    }
+    return norm;
+  }
+
+  Offset _badgeNormalizedForSticky(ReadingNote n) {
+    return _stickyResolvedNorm(n);
+  }
+
   Future<PdfPageText?> _structuredForPage(int pageNum) async {
     final cached = _structuredByPage[pageNum];
     if (cached != null) return cached;
@@ -572,6 +718,95 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     return loaded;
   }
 
+  void _clearQueuedPlaybackState() {
+    _queue.clear();
+    _pageTextFromQueue.clear();
+    _pagesMaterializedIntoQueue.clear();
+  }
+
+  void _maybeTrimStructuredTextCache() {
+    if (_isPlaying) return;
+    final tp = _totalPages;
+    if (tp == null || tp == 0) return;
+
+    final keep = <int>{};
+    for (final h in _readingHighlights) {
+      final p = h.pageNumber;
+      if (p >= 1 && p <= tp) keep.add(p);
+    }
+    for (var d = -_kStructuredTextCacheNearbyPages;
+        d <= _kStructuredTextCacheNearbyPages;
+        d++) {
+      final p = _currentPage + d;
+      if (p >= 1 && p <= tp) keep.add(p);
+    }
+    final keys = List<int>.from(_structuredByPage.keys);
+    for (final k in keys) {
+      if (!keep.contains(k)) _structuredByPage.remove(k);
+    }
+  }
+
+  Future<void> _materializePageIntoQueue(
+    int pageNum, {
+    required int chunkMax,
+    required bool splitParagraphs,
+  }) async {
+    if (!mounted) return;
+    if (pageNum < 1) return;
+    if (_totalPages != null && pageNum > _totalPages!) return;
+    if (_pagesMaterializedIntoQueue.contains(pageNum)) return;
+    _pagesMaterializedIntoQueue.add(pageNum);
+
+    final structured = await _structuredForPage(pageNum);
+    if (!mounted) return;
+
+    final pageFull = structured == null
+        ? ''
+        : _preparePageSourceText(structured.fullText);
+    if (pageFull.isEmpty) return;
+
+    _pageTextFromQueue[pageNum] = pageFull;
+    final parts = _splitTtsWithOffsets(
+      pageFull,
+      maxLen: chunkMax,
+      splitAtParagraphs: splitParagraphs,
+    );
+    for (final part in parts) {
+      _queue.add(_Chunk(pageNum, part.text, part.start));
+    }
+  }
+
+  /// Pré-carrega páginas à medida (não faz `loadStructuredText` no livro inteiro ao iniciar Play).
+  Future<void> _ensureQueuedChunksExtendThrough(int maxChunkIndexInclusive) async {
+    final tp = _totalPages;
+    var safety = (tp ?? 512) + 32;
+    while (mounted &&
+        maxChunkIndexInclusive >= 0 &&
+        _queue.length <= maxChunkIndexInclusive) {
+      if (safety-- <= 0) break;
+
+      if (!_autoContinue) return;
+
+      if (tp == null) return;
+
+      final basePage = _queue.isEmpty ? (_currentPage - 1) : _queue.last.page;
+      var probe = basePage + 1;
+
+      while (probe <= tp && _pagesMaterializedIntoQueue.contains(probe)) {
+        probe++;
+      }
+      if (probe > tp) {
+        return;
+      }
+
+      await _materializePageIntoQueue(
+        probe,
+        chunkMax: isSherpaOffline ? 20000 : 3000,
+        splitParagraphs: !isSherpaOffline,
+      );
+    }
+  }
+
   void _paintReadAloudHighlight(ui.Canvas canvas, Rect pageRect, PdfPage page) {
     final range = _readHighlight;
     if (!_isPlaying || range == null || range.pageNumber != page.pageNumber) {
@@ -582,14 +817,29 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.75
       ..color = const Color(0xCFFFFFFF);
-    for (final br in range.enumerateFragmentBoundingRects()) {
-      final r = br.bounds
-          .toRect(page: page, scaledPageSize: pageRect.size)
-          .translate(pageRect.left, pageRect.top)
-          .inflate(0.85);
+    final raw = [
+      for (final br in range.enumerateFragmentBoundingRects())
+        br.bounds
+            .toRect(page: page, scaledPageSize: pageRect.size)
+            .translate(pageRect.left, pageRect.top),
+    ];
+    final bands = mergeAdjacentPdfHighlightRects(raw)
+        .map((r) => r.inflate(0.85))
+        .toList();
+    for (final r in bands) {
       canvas.drawRect(r, fill);
       canvas.drawRect(r, stroke);
     }
+  }
+
+  void _paintSavedHighlights(ui.Canvas canvas, Rect pageRect, PdfPage page) {
+    paintReadingHighlightsOnPdfPage(
+      canvas: canvas,
+      pageRect: pageRect,
+      page: page,
+      highlights: _readingHighlights,
+      structuredByPage: _structuredByPage,
+    );
   }
 
   bool _onPdfTap(
@@ -598,8 +848,79 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     PdfViewerGeneralTapHandlerDetails details,
   ) {
     if (details.type != PdfViewerGeneralTapType.tap) return false;
+    if (_awaitingStickyLineTap) {
+      unawaited(_handleStickyLinePlacement(details.documentPosition));
+      return false;
+    }
     unawaited(_jumpFromDocumentTap(details.documentPosition));
     return false;
+  }
+
+  Future<void> _handleStickyLinePlacement(Offset docPoint) async {
+    if (!_pdfController.isReady || !mounted) return;
+    final pageNum = _pageNumberAtDocumentPoint(docPoint);
+    if (pageNum == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('Toca dentro do texto da página.'),
+        ),
+      );
+      return;
+    }
+    final charIndex = await _charIndexAtDocumentPoint(docPoint, pageNum);
+    if (charIndex == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('Sem texto legível aqui — tenta noutra linha.'),
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+    final structured = await _structuredForPage(pageNum);
+    if (structured == null || !mounted) return;
+
+    final linkedPrep = linkedPrepCharFromRawTap(structured, charIndex);
+    final noteCountSamePage =
+        _readingNotes.where((n) => n.pageNumber == pageNum).length;
+    final spawn = stickySpawnAnchorsNormalized(noteCountSamePage);
+
+    if (pageNum != _currentPage) {
+      setState(() => _currentPage = pageNum);
+      if (!_isPlaying) _persistPage();
+      await _pdfController.goToPage(pageNumber: pageNum);
+      if (!mounted) return;
+    }
+
+    final completer = Completer<void>();
+    WidgetsBinding.instance.addPostFrameCallback((_) => completer.complete());
+    await completer.future;
+    if (!mounted) return;
+
+    var anchor = _normalizedStickyAnchorFromRaw(structured, pageNum, charIndex);
+    if (anchor == Offset.zero) {
+      anchor = spawn;
+    }
+
+    setState(() => _awaitingStickyLineTap = false);
+    ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+
+    if (!mounted) return;
+    final pal = kPdfStickyPalettes[noteCountSamePage % kPdfStickyPalettes.length];
+    final r = await pushPdfStickyComposer(
+      context: context,
+      libraryItemId: widget.item.id,
+      pageNumber: pageNum,
+      anchorX: anchor.dx,
+      anchorY: anchor.dy,
+      initialPaperArgb: pal.$1,
+      initialTextArgb: pal.$2,
+      linkedPrepCharIndex: linkedPrep,
+    );
+    await _applyStickyComposer(r);
   }
 
   Future<void> _jumpFromDocumentTap(Offset docPoint) async {
@@ -653,6 +974,350 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     return null;
   }
 
+  bool _readingHighlightDuplicate(ReadingHighlight candidate) {
+    for (final h in _readingHighlights) {
+      if (h.pageNumber == candidate.pageNumber &&
+          h.start == candidate.start &&
+          h.end == candidate.end) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void _customizePdfContextMenu(
+    PdfViewerContextMenuBuilderParams params,
+    List<ContextMenuButtonItem> items,
+  ) {
+    if (!params.isTextSelectionEnabled) return;
+    if (!params.textSelectionDelegate.hasSelectedText) return;
+    items.insert(
+      0,
+      ContextMenuButtonItem(
+        label: 'Grifar e guardar',
+        onPressed: () async {
+          final del = params.textSelectionDelegate;
+          params.dismissContextMenu();
+          await _persistHighlightsFromSelection(del);
+        },
+      ),
+    );
+  }
+
+  Future<void> _persistHighlightsFromSelection(
+    PdfTextSelectionDelegate delegate,
+  ) async {
+    if (!_pdfController.isReady || !mounted) return;
+    List<PdfPageTextRange> ranges;
+    try {
+      ranges = await delegate.getSelectedTextRanges();
+    } catch (_) {
+      ranges = [];
+    }
+    if (ranges.isEmpty) {
+      await delegate.clearTextSelection();
+      if (!mounted) return;
+      if (_pdfController.isReady) _pdfController.invalidate();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('Seleção vazia — escolhe outro trecho.'),
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    final picked =
+        await showReadingHighlightColorPicker(context);
+    await delegate.clearTextSelection();
+    if (!mounted) return;
+
+    if (picked == null) {
+      if (_pdfController.isReady) _pdfController.invalidate();
+      return;
+    }
+
+    final now = DateTime.now();
+    var added = 0;
+    for (var ri = 0; ri < ranges.length; ri++) {
+      final r = ranges[ri];
+      final pageNum = r.pageNumber;
+      final len = r.pageText.fullText.length;
+      final s = r.start.clamp(0, len);
+      final e = r.end.clamp(0, len);
+      if (e <= s) continue;
+      final previewRaw =
+          len == 0 ? '' : r.pageText.fullText.substring(s, min(e, s + 140));
+      final preview = _preparePageSourceText(previewRaw).trim();
+      final nid = '${widget.item.id}-h-${now.microsecondsSinceEpoch}-$ri';
+      final hl = ReadingHighlight(
+        id: nid,
+        libraryItemId: widget.item.id,
+        pageNumber: pageNum,
+        start: s,
+        end: e,
+        preview: preview.isEmpty ? '…' : preview,
+        createdAt: now,
+        highlightArgb: picked,
+      );
+      if (!_readingHighlightDuplicate(hl)) {
+        _readingHighlights.add(hl);
+        _structuredByPage[pageNum] = r.pageText;
+        added++;
+      }
+    }
+    if (!mounted) return;
+    if (added == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          behavior: SnackBarBehavior.floating,
+          content: Text('Esse trecho já estava grifado.'),
+        ),
+      );
+      return;
+    }
+    setState(() {});
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(added == 1 ? 'Grifo guardado.' : '$added grifos guardados.'),
+      ),
+    );
+    await _persistReadingNotes();
+    if (mounted && _pdfController.isReady) {
+      _pdfController.invalidate();
+    }
+  }
+
+  Future<void> _jumpToStoredHighlight(ReadingHighlight h) async {
+    if (!_pdfController.isReady || !mounted) return;
+    final structured = await _structuredForPage(h.pageNumber);
+    if (structured == null || !mounted) return;
+    final len = structured.fullText.length;
+    final s = h.start.clamp(0, len);
+    final e = h.end.clamp(s, len);
+    if (s >= e) return;
+    final range = PdfPageTextRange(pageText: structured, start: s, end: e);
+    final b = range.bounds;
+    try {
+      if (h.pageNumber != _currentPage) {
+        setState(() => _currentPage = h.pageNumber);
+        if (!_isPlaying) {
+          _persistPage();
+        }
+      }
+      await _pdfController.goToRectInsidePage(
+        pageNumber: h.pageNumber,
+        rect: b,
+        anchor: PdfPageAnchor.center,
+      );
+      if (_pdfController.isReady) {
+        _pdfController.invalidate();
+      }
+    } catch (_) {}
+  }
+
+  Widget _readingBookmarksSectionHeader(
+    BuildContext context,
+    IconData icon,
+    String title,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 10, 18, 4),
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: Theme.of(context).colorScheme.primary),
+          const SizedBox(width: 10),
+          Text(
+            title,
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openReadingBookmarksSheet() async {
+    await _reloadReadingNotesForItem();
+    if (!mounted) return;
+    var sortedNotes = [..._readingNotes]
+      ..sort((a, b) {
+        final p = a.pageNumber.compareTo(b.pageNumber);
+        if (p != 0) return p;
+        return b.createdAt.compareTo(a.createdAt);
+      });
+    var sortedHl = [..._readingHighlights]
+      ..sort((a, b) {
+        final p = a.pageNumber.compareTo(b.pageNumber);
+        if (p != 0) return p;
+        return b.createdAt.compareTo(a.createdAt);
+      });
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      showDragHandle: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setInner) {
+            void refreshLocals() {
+              sortedNotes = [..._readingNotes]
+                ..sort((a, b) {
+                  final p = a.pageNumber.compareTo(b.pageNumber);
+                  if (p != 0) return p;
+                  return b.createdAt.compareTo(a.createdAt);
+                });
+              sortedHl = [..._readingHighlights]
+                ..sort((a, b) {
+                  final p = a.pageNumber.compareTo(b.pageNumber);
+                  if (p != 0) return p;
+                  return b.createdAt.compareTo(a.createdAt);
+                });
+            }
+
+            return SafeArea(
+              child: SizedBox(
+                height: MediaQuery.sizeOf(ctx).height * 0.72,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+                      child: Text(
+                        'Marcadores deste PDF',
+                        style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                      ),
+                    ),
+                    Expanded(
+                      child: sortedNotes.isEmpty && sortedHl.isEmpty
+                          ? Center(
+                              child: Padding(
+                                padding: const EdgeInsets.all(22),
+                                child: Text(
+                                  'Ainda não tens notas nem grifos guardados neste livro.',
+                                  textAlign: TextAlign.center,
+                                  style: Theme.of(ctx)
+                                      .textTheme
+                                      .bodyMedium
+                                      ?.copyWith(
+                                        color: Theme.of(ctx)
+                                            .colorScheme
+                                            .onSurfaceVariant,
+                                      ),
+                                ),
+                              ),
+                            )
+                          : ListView(
+                              padding: const EdgeInsets.only(bottom: 18),
+                              children: [
+                                if (sortedNotes.isNotEmpty) ...[
+                                  _readingBookmarksSectionHeader(
+                                    ctx,
+                                    Icons.sticky_note_2_rounded,
+                                    'Notas de rodapé',
+                                  ),
+                                  ...sortedNotes.map((n) {
+                                    return ListTile(
+                                      leading: const Icon(Icons.sell_outlined),
+                                      title: Text(
+                                        n.body.trim().isEmpty
+                                            ? '(Nota vazia)'
+                                            : n.body.trim(),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      subtitle: Text('Pág. ${n.pageNumber}'),
+                                      onTap: () async {
+                                        Navigator.pop(ctx);
+                                        if (mounted) {
+                                          setState(() {
+                                            _currentPage = n.pageNumber;
+                                          });
+                                        }
+                                        await _pdfController.goToPage(
+                                          pageNumber: n.pageNumber,
+                                        );
+                                        if (!_isPlaying) {
+                                          _persistPage();
+                                        }
+                                        if (mounted) {
+                                          await _peekSticky(n);
+                                        }
+                                      },
+                                    );
+                                  }),
+                                ],
+                                if (sortedHl.isNotEmpty) ...[
+                                  _readingBookmarksSectionHeader(
+                                    ctx,
+                                    Icons.highlight_alt_rounded,
+                                    'Grifos guardados',
+                                  ),
+                                  ...sortedHl.map((h) {
+                                    return ListTile(
+                                      leading: Icon(
+                                        Icons.push_pin_rounded,
+                                        color: Color(h.highlightArgb),
+                                      ),
+                                      title: Text(
+                                        h.preview,
+                                        maxLines: 4,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      subtitle: Text(
+                                        'Pág. ${h.pageNumber} · cor do grifo · tocar para ir ao texto',
+                                      ),
+                                      trailing: IconButton(
+                                        tooltip: 'Apagar',
+                                        icon: Icon(
+                                          Icons.delete_outline_rounded,
+                                          color: Theme.of(ctx).colorScheme.error,
+                                        ),
+                                        onPressed: () async {
+                                          if (!mounted) return;
+                                          setState(() {
+                                            _readingHighlights.removeWhere(
+                                                (e) => e.id == h.id);
+                                          });
+                                          await _persistReadingNotes();
+                                          if (_pdfController.isReady) {
+                                            _pdfController.invalidate();
+                                          }
+                                          refreshLocals();
+                                          setInner(() {});
+                                          if (!ctx.mounted) return;
+                                          if (sortedNotes.isEmpty &&
+                                              sortedHl.isEmpty) {
+                                            Navigator.pop(ctx);
+                                          }
+                                        },
+                                      ),
+                                      onTap: () async {
+                                        Navigator.pop(ctx);
+                                        await _jumpToStoredHighlight(h);
+                                      },
+                                    );
+                                  }),
+                                ],
+                              ],
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   /// Divide texto em segmentos até [maxLen], cortando preferencialmente em frases.
   /// Com [splitAtParagraphs]: também corta em `\n\n` / `\n` (bom para motor do sistema).
   /// Com false (Sherpa offline): ignora parágrafos — leitura contínua com o mínimo de WAVs.
@@ -704,27 +1369,29 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   }
 
   Future<void> _fillQueue({int? fromPage}) async {
-    _queue.clear();
-    _pageTextFromQueue.clear();
+    _clearQueuedPlaybackState();
+
     final start = fromPage ?? _currentPage;
-    final end = _autoContinue ? (_totalPages ?? 0) : start;
-    // Sherpa: poucos segmentos por página → menos gaps entre ONNX/WAVs (leitura contínua).
     final chunkMax = isSherpaOffline ? 20000 : 3000;
-    for (var pg = start; pg <= end; pg++) {
-      if (!mounted) return;
-      final structured = await _structuredForPage(pg);
-      if (structured == null) continue;
-      final pageFull = _preparePageSourceText(structured.fullText);
-      if (pageFull.isEmpty) continue;
-      _pageTextFromQueue[pg] = pageFull;
-      for (final part in _splitTtsWithOffsets(
-            pageFull,
-            maxLen: chunkMax,
-            splitAtParagraphs: !isSherpaOffline,
-          )) {
-        _queue.add(_Chunk(pg, part.text, part.start));
-      }
+    final splitParagraphsMode = !isSherpaOffline;
+
+    await _materializePageIntoQueue(
+      start,
+      chunkMax: chunkMax,
+      splitParagraphs: splitParagraphsMode,
+    );
+    if (!mounted) return;
+
+    if (_autoContinue &&
+        _totalPages != null &&
+        start < _totalPages!) {
+      await _materializePageIntoQueue(
+        start + 1,
+        chunkMax: chunkMax,
+        splitParagraphs: splitParagraphsMode,
+      );
     }
+    await _ensureQueuedChunksExtendThrough(1);
   }
 
   Future<void> _play() async {
@@ -732,6 +1399,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     if (_queue.isNotEmpty && _chunkIndex < _queue.length) {
       // continuar a mesma fila
     } else {
+      await _reloadReadingNotesForItem();
+      if (!mounted) return;
       await _fillQueue();
       _chunkIndex = 0;
     }
@@ -747,20 +1416,17 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
     try {
       await _ensureSherpaInfrastructure();
-    } catch (e, st) {
-      debugPrint('Sherpa infra: $e');
-      debugPrintStack(stackTrace: st);
-      if (mounted) {
-        final msg =
-            e is StateError ? e.message : 'Offline TTS: $e';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 12),
-            content: Text(msg, maxLines: 8),
-          ),
-        );
-      }
+    } catch (e) {
+      if (!mounted) return;
+      final msg =
+          e is StateError ? e.message : 'Offline TTS: $e';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 12),
+          content: Text(msg, maxLines: 8),
+        ),
+      );
       return;
     }
 
@@ -824,7 +1490,10 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     }
     try {
       _clearSherpaPrefetchFutures();
-      while (mounted && _isPlaying && _chunkIndex < _queue.length) {
+      while (mounted && _isPlaying) {
+        await _ensureQueuedChunksExtendThrough(_chunkIndex + 1);
+        if (_chunkIndex >= _queue.length) break;
+
         final g0 = _readingPrefetchGeneration;
         final c = _queue[_chunkIndex];
         if (!mounted || !_isPlaying) break;
@@ -894,7 +1563,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
               wavPath,
               volume: _playbackVolume,
               playbackSpeed: _wavPlaybackSpeed,
-              mediaTitle: _mediaChunkTitle(c.text, c.page),
+              mediaTitle: _notificationTitleForChunk(c),
               mediaAlbum: widget.item.displayName,
               mediaArtUri: _coverArtUri(),
             );
@@ -945,8 +1614,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
           _isGenerating = false;
           _clearHighlight();
           if (_chunkIndex >= _queue.length) {
-            _queue.clear();
-            _pageTextFromQueue.clear();
+            _clearQueuedPlaybackState();
             _chunkIndex = 0;
           }
         });
@@ -1042,8 +1710,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   void _onPrevPage() {
     _stopPlayback();
     if (_currentPage <= 1) return;
-    _queue.clear();
-    _pageTextFromQueue.clear();
+    _clearQueuedPlaybackState();
     _chunkIndex = 0;
     final page = _currentPage - 1;
     setState(() => _currentPage = page);
@@ -1056,8 +1723,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   void _onNextPage() {
     _stopPlayback();
     if (_totalPages == null || _currentPage >= _totalPages!) return;
-    _queue.clear();
-    _pageTextFromQueue.clear();
+    _clearQueuedPlaybackState();
     _chunkIndex = 0;
     final page = _currentPage + 1;
     setState(() => _currentPage = page);
@@ -1144,6 +1810,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         ((n / (baseCharsPerSec * rateFactor)).ceil()).clamp(3, 36000);
     return Duration(seconds: secs);
   }
+
+  String _notificationTitleForChunk(_Chunk c) =>
+      _mediaChunkTitle(c.text, c.page);
+
+  String _progressStripLabel(_Chunk c) =>
+      'Trecho · pág. ${c.page}';
 
   String _formatShortDuration(Duration d) {
     final totalMs = max(0, d.inMilliseconds);
@@ -1325,7 +1997,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Trecho · pág. ${chunk.page}',
+          _progressStripLabel(chunk),
           style:
               Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
         ),
@@ -1557,8 +2229,119 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     );
   }
 
+  Future<void> _applyStickyComposer(PdfStickyComposerResult? r) async {
+    if (r == null || !mounted) return;
+    setState(() {
+      if (r.createdNew) {
+        _readingNotes.add(r.note);
+      } else {
+        final ix = _readingNotes.indexWhere((e) => e.id == r.note.id);
+        if (ix >= 0) {
+          _readingNotes[ix] = r.note;
+        }
+      }
+    });
+    await _persistReadingNotes();
+  }
+
+  Future<void> _peekSticky(ReadingNote n) async {
+    await showPdfStickyPeekSheet(
+      context: context,
+      note: n,
+      onEdit: () async {
+        if (!mounted) return;
+        final r = await pushPdfStickyComposer(
+          context: context,
+          libraryItemId: widget.item.id,
+          pageNumber: n.pageNumber,
+          anchorX: n.anchorX,
+          anchorY: n.anchorY,
+          existing: n,
+          initialPaperArgb: n.paperArgb,
+          initialTextArgb: n.textArgb,
+          linkedPrepCharIndex: n.linkedPrepCharIndex,
+        );
+        await _applyStickyComposer(r);
+      },
+      onDeleted: () async {
+        if (!mounted) return;
+        setState(() {
+          _readingNotes.removeWhere((e) => e.id == n.id);
+        });
+        await _persistReadingNotes();
+      },
+    );
+  }
+
+  void _offerAddStickyNote() {
+    if (!_viewerReady || _loadError != null) return;
+    if (_awaitingStickyLineTap) {
+      ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+      setState(() => _awaitingStickyLineTap = false);
+      return;
+    }
+    setState(() => _awaitingStickyLineTap = true);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(minutes: 3),
+        content: const Text(
+          'Toca na linha do texto onde queres ligar a nota de rodapé.',
+        ),
+        action: SnackBarAction(
+          label: 'Cancelar',
+          onPressed: () {
+            if (!mounted) return;
+            setState(() => _awaitingStickyLineTap = false);
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _readingStickiesOverlay() {
+    if (!_viewerReady) return const SizedBox.shrink();
+    final list =
+        _readingNotes.where((n) => n.pageNumber == _currentPage).toList();
+    return ValueListenableBuilder<Matrix4>(
+      valueListenable: _pdfController,
+      builder: (_, _, _) {
+        return SizedBox.expand(
+          key: _stickyStackLayerKey,
+          child: PdfStickyNotesViewport(
+            notesForCurrentPage: list,
+            anchorNormalizedFor: _badgeNormalizedForSticky,
+            onOpenNote: _peekSticky,
+            onPersistNotes: _persistReadingNotes,
+            beforeDragHoldDuration: Duration.zero,
+            onDragMove: (trip) {
+              final n = trip.$1;
+              final d = trip.$2;
+              final vp = trip.$3;
+              final ni = _readingNotes.indexWhere((e) => e.id == n.id);
+              if (ni < 0) return;
+              final cur = _readingNotes[ni];
+              final nx =
+                  (cur.anchorX * vp.width + d.delta.dx) / vp.width;
+              final ny =
+                  (cur.anchorY * vp.height + d.delta.dy) / vp.height;
+              setState(() {
+                _readingNotes[ni] = cur.copyWith(
+                  anchorX: nx.clamp(0.06, 0.94),
+                  anchorY: ny.clamp(0.06, 0.93),
+                );
+              });
+            },
+          ),
+        );
+      },
+    );
+  }
+
   @override
   void dispose() {
+    _awaitingStickyLineTap = false;
+    ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
     _paused = false;
     _completeResumeWaitIfAny();
     _bumpReadingPrefetchGen();
@@ -1568,7 +2351,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     WidgetsBinding.instance.removeObserver(this);
     _persistLibraryBookmarkOnExit();
     _structuredByPage.clear();
-    _pageTextFromQueue.clear();
+    _pagesMaterializedIntoQueue.clear();
+    _clearQueuedPlaybackState();
     if (isSherpaOffline) {
       unawaited(TtsService.instance.stop());
     } else {
@@ -1637,6 +2421,24 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                     ),
                   ),
               ],
+              IconButton(
+                tooltip:
+                    'Marcadores — notas e grifos guardados neste PDF',
+                icon: const Icon(Icons.bookmarks_outlined),
+                onPressed: (!_viewerReady || _loadError != null)
+                    ? null
+                    : () => unawaited(_openReadingBookmarksSheet()),
+              ),
+              IconButton(
+                tooltip: _awaitingStickyLineTap
+                    ? 'Cancelar (premir de novo)'
+                    : 'Nota de rodapé — liga ao texto ao tocar numa linha',
+                icon: const Icon(Icons.sticky_note_2_rounded),
+                onPressed:
+                    (_viewerReady && _loadError == null)
+                        ? _offerAddStickyNote
+                        : null,
+              ),
               Padding(
                 padding: const EdgeInsets.only(right: 6),
                 child: FilledButton.tonalIcon(
@@ -1716,7 +2518,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                     initialPageNumber: initialPage,
                     params: PdfViewerParams(
                       backgroundColor: Colors.black,
-                      pagePaintCallbacks: [_paintReadAloudHighlight],
+                      textSelectionParams: const PdfTextSelectionParams(),
+                      customizeContextMenuItems: _customizePdfContextMenu,
+                      pagePaintCallbacks: [
+                        _paintSavedHighlights,
+                        _paintReadAloudHighlight,
+                      ],
                       onGeneralTap: _onPdfTap,
                       onDocumentChanged: (doc) {
                         if (doc == null) return;
@@ -1732,13 +2539,16 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                         if (n == null || n == _currentPage) return;
                         final wasPlaying = _isPlaying;
                         if (!wasPlaying) {
-                          _queue.clear();
-                          _pageTextFromQueue.clear();
+                          _clearQueuedPlaybackState();
                           _chunkIndex = 0;
                         }
                         setState(() => _currentPage = n);
                         if (!wasPlaying) {
                           _persistPage();
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (!mounted) return;
+                            _maybeTrimStructuredTextCache();
+                          });
                         }
                       },
                     ),
@@ -1812,6 +2622,10 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                         ),
                       ),
                     ),
+                  if (_viewerReady && _loadError == null)
+                    Positioned.fill(
+                      child: _readingStickiesOverlay(),
+                    ),
                   Positioned(
                     left: 0,
                     right: 0,
@@ -1870,9 +2684,7 @@ class _ReadAloudVoiceModalContentState
       await widget.host.selectSherpaVoice(id);
       if (!mounted) return;
       Navigator.of(context).pop();
-    } catch (e, st) {
-      debugPrint('selectSherpaVoice: $e');
-      debugPrintStack(stackTrace: st);
+    } catch (e) {
       if (!mounted) return;
       final msg = e is StateError ? e.message : '${e.runtimeType}: $e';
       ScaffoldMessenger.of(context).showSnackBar(

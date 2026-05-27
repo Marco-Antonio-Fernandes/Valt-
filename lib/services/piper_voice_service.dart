@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -153,9 +152,7 @@ class PiperVoiceService {
       for (final item in voicesList) {
         try {
           allVoices.add(PiperVoice.fromJson(item as Map<String, dynamic>));
-        } catch (e) {
-          debugPrint('PiperVoiceService: skip voice: $e');
-        }
+        } catch (_) {}
       }
 
       offset += voicesList.length;
