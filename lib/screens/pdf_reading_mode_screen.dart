@@ -19,7 +19,7 @@ import '../models/reading_highlight.dart';
 import '../models/reading_note.dart';
 import '../services/piper_voice_service.dart';
 import '../services/reading_notes_store.dart';
-import '../services/tts_service.dart' show TtsService;
+import '../services/tts_service.dart' show TtsService, TtsSynthesisCancelled;
 import '../services/vault_reading_audio.dart';
 import '../widgets/pdf_sticky_notes.dart';
 import '../widgets/reading_highlight_color_sheet.dart';
@@ -42,6 +42,12 @@ const _kStructuredTextCacheNearbyPages = 2;
 const _kMaxSequentialQueuePageLoads = 2;
 /// Trechos Sherpa menores → saltar no fim da página não gera um WAV gigante.
 const _kSherpaTtsChunkMax = 5500;
+/// Fila acima disto: reancorar na página alvo em vez de saltar numa fila gigante.
+const _kQueueReanchorChunkThreshold = 48;
+/// Throttle do thumb da barra de progresso (evita rebuild do PDF a cada pixel).
+const _kScrubUiThrottleMs = 56;
+/// Avanço/retrocesso dos botões junto ao play/stop.
+const _kReadingTimeSkipSeconds = 5;
 
 class PdfReadingModeScreen extends StatefulWidget {
   const PdfReadingModeScreen({
@@ -120,6 +126,17 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   /// Arrastar a barra de progresso (timeline da página inteira, não só o WAV atual).
   var _pageTimelineScrubbing = false;
   var _pageTimelineFraction = 0.0;
+  DateTime? _lastScrubUiTick;
+  int _scrubCommitToken = 0;
+
+  /// Cache da timeline da página (evita varrer [_queue] a cada tick do WAV).
+  int? _cachedTimelinePage;
+  List<int>? _cachedTimelineIndices;
+  List<int>? _cachedTimelineDurationsMs;
+  int _cachedTimelineTotalMs = 0;
+  int _cachedTimelineQueueLen = -1;
+  int _cachedTimelineChunkIndex = -1;
+  int _cachedTimelineWavDurMs = -1;
 
   var _playbackVolume = 1.0;
   var _pendingBackChunk = false;
@@ -168,9 +185,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       if (!mounted || !_isPlaying) return;
       switch (s) {
         case VaultReadingSegmentSkip.forward:
-          _seekNextSegment();
+          unawaited(_seekReadingSeconds(_kReadingTimeSkipSeconds));
         case VaultReadingSegmentSkip.backward:
-          _seekPreviousSegment();
+          unawaited(_seekReadingSeconds(-_kReadingTimeSkipSeconds));
       }
     });
     unawaited(_bootstrapTts());
@@ -282,6 +299,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
       _wavChunkPos = pos;
       if (d != null && d.inMilliseconds > 0) {
+        if (_wavChunkDur?.inMilliseconds != d.inMilliseconds) {
+          _invalidatePageTimelineCache();
+        }
         _wavChunkDur = d;
       }
 
@@ -348,35 +368,49 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     }
   }
 
-  void _seekPreviousSegment() {
-    if (!_isPlaying || _chunkIndex <= 0) return;
-    _pendingBackChunk = true;
-    _interruptChunkPlayback();
-  }
+  /// Botões centrais (±5 s) e controlos compactos da notificação.
+  Future<void> _seekReadingSeconds(int deltaSec) async {
+    if (!mounted || !_isPlaying || _queue.isEmpty || _chunkIndex >= _queue.length) {
+      return;
+    }
 
-  void _seekNextSegment() {
-    if (!_isPlaying) return;
-    final nextIdx = _chunkIndex + 1;
-    if (nextIdx >= _queue.length) {
-      if (_queue.isEmpty ||
-          _currentPage > _queue.last.page + 1) {
-        _reanchorInFlight = _reanchorPlaybackToPage(
-          _currentPage,
-          interruptIfPlaying: true,
-        );
-        return;
-      }
+    if (isSherpaOffline && VaultReadingAudio.isReady) {
+      final page = _queue[_chunkIndex].page;
+      final timeline = _pageAudioTimeline(page);
+      if (timeline.totalMs <= 0) return;
+      final currentMs = _pageTimelinePositionMs(page);
+      final targetMs =
+          (currentMs + deltaSec * 1000).clamp(0, timeline.totalMs);
+      if (targetMs == currentMs) return;
+      await _commitPageTimelineScrub(targetMs / timeline.totalMs);
       return;
     }
-    if (_queue[nextIdx].page != _currentPage &&
-        (_queue[nextIdx].page - _currentPage).abs() > 2) {
-      _reanchorInFlight = _reanchorPlaybackToPage(
-        _currentPage,
-        interruptIfPlaying: true,
-      );
+
+    final chunk = _queue[_chunkIndex];
+    final estMs =
+        _estimatedFlutterChunkDuration(chunk).inMilliseconds.clamp(1, 1 << 30);
+    final currentMs = (_flutterWordProgress * estMs).round();
+    final targetMs = (currentMs + deltaSec * 1000).clamp(0, estMs);
+
+    if (deltaSec < 0 && targetMs == 0 && _chunkIndex > 0) {
+      _pendingBackChunk = true;
+      _interruptChunkPlayback();
       return;
     }
-    _pendingSkipForwardChunk = true;
+    if (deltaSec > 0 &&
+        targetMs >= estMs &&
+        _chunkIndex + 1 < _queue.length) {
+      _pendingSkipForwardChunk = true;
+      _interruptChunkPlayback();
+      return;
+    }
+
+    final frac = estMs <= 0 ? 0.0 : targetMs / estMs;
+    final trim = (chunk.text.length * frac).floor().clamp(0, chunk.text.length);
+    final safeTrim =
+        trim >= chunk.text.length ? max(0, chunk.text.length - 1) : trim;
+    _pendingJumpChunk = _chunkIndex;
+    _pendingSpeakStartInChunk = safeTrim > 0 ? safeTrim : null;
     _interruptChunkPlayback();
   }
 
@@ -590,18 +624,42 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _readingPrefetchGeneration++;
   }
 
+  void _invalidatePageTimelineCache() {
+    _cachedTimelinePage = null;
+    _cachedTimelineIndices = null;
+    _cachedTimelineDurationsMs = null;
+    _cachedTimelineTotalMs = 0;
+    _cachedTimelineQueueLen = -1;
+    _cachedTimelineChunkIndex = -1;
+    _cachedTimelineWavDurMs = -1;
+  }
+
+  /// Invalida prefetch e cancela síntese Sherpa em fila (scrub/pausa/interrupt).
+  void _cancelSherpaPipeline() {
+    _bumpReadingPrefetchGen();
+    _clearSherpaPrefetchFutures();
+    _invalidatePageTimelineCache();
+    if (isSherpaOffline && !kIsWeb) {
+      unawaited(TtsService.instance.cancelPendingSynthesis());
+    }
+  }
+
   Future<String?> _prepareSherpaWavIfActive(String text, int genAtSchedule) async {
-    final path =
-        await TtsService.instance.prepareWavForText(_normalizeTtsText(text));
-    if (!mounted ||
-        !_isPlaying ||
-        genAtSchedule != _readingPrefetchGeneration) {
-      try {
-        File(path).deleteSync();
-      } catch (_) {}
+    try {
+      final path =
+          await TtsService.instance.prepareWavForText(_normalizeTtsText(text));
+      if (!mounted ||
+          !_isPlaying ||
+          genAtSchedule != _readingPrefetchGeneration) {
+        try {
+          File(path).deleteSync();
+        } catch (_) {}
+        return null;
+      }
+      return path;
+    } on TtsSynthesisCancelled {
       return null;
     }
-    return path;
   }
 
   void _attachSherpaSpareChain(
@@ -797,6 +855,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _queue.clear();
     _pageTextFromQueue.clear();
     _pagesMaterializedIntoQueue.clear();
+    _invalidatePageTimelineCache();
   }
 
   bool _queueHasChunksForPage(int pageNum) {
@@ -842,8 +901,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   void _scheduleJumpToPageOffset(int pageNum, int charOffset) {
     final target = _resolveJumpOnPage(pageNum, charOffset);
-    _bumpReadingPrefetchGen();
-    _clearSherpaPrefetchFutures();
+    _cancelSherpaPipeline();
     _pendingJumpChunk = target.chunkIndex;
     _pendingSpeakStartInChunk =
         target.trimInChunk > 0 ? target.trimInChunk : null;
@@ -864,8 +922,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     if (_totalPages != null && pageNum > _totalPages!) return;
 
     final token = ++_queueRebuildToken;
-    _bumpReadingPrefetchGen();
-    _clearSherpaPrefetchFutures();
+    _cancelSherpaPipeline();
 
     if (interruptIfPlaying && _isPlaying) {
       _interruptChunkPlayback();
@@ -1776,6 +1833,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
             if (wavPath == null) {
               if (!mounted || !_isPlaying) break;
+              if (g0 != _readingPrefetchGeneration) continue;
               if (mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
@@ -1923,8 +1981,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   void _stopPlayback() {
     _completeResumeWaitIfAny();
     _paused = false;
-    _bumpReadingPrefetchGen();
-    _clearSherpaPrefetchFutures();
+    _cancelSherpaPipeline();
     _isPlaying = false;
     _pendingBackChunk = false;
     _pendingSkipForwardChunk = false;
@@ -1985,8 +2042,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _completeResumeWaitIfAny();
       return;
     }
-    _bumpReadingPrefetchGen();
-    _clearSherpaPrefetchFutures();
+    _cancelSherpaPipeline();
     setState(() => _paused = true);
     if (isSherpaOffline) {
       unawaited(TtsService.instance.pauseReadingPlayback());
@@ -2068,19 +2124,41 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   ({List<int> indices, List<int> durationsMs, int totalMs}) _pageAudioTimeline(
     int pageNum,
   ) {
+    final wavDurMs = _wavChunkDur?.inMilliseconds ?? 0;
+    if (_cachedTimelinePage == pageNum &&
+        _cachedTimelineIndices != null &&
+        _cachedTimelineDurationsMs != null &&
+        _cachedTimelineQueueLen == _queue.length &&
+        _cachedTimelineChunkIndex == _chunkIndex &&
+        _cachedTimelineWavDurMs == wavDurMs) {
+      return (
+        indices: _cachedTimelineIndices!,
+        durationsMs: _cachedTimelineDurationsMs!,
+        totalMs: _cachedTimelineTotalMs,
+      );
+    }
+
     final indices = <int>[];
     final durationsMs = <int>[];
     for (var i = 0; i < _queue.length; i++) {
       if (_queue[i].page != pageNum) continue;
       indices.add(i);
-      if (i == _chunkIndex &&
-          (_wavChunkDur?.inMilliseconds ?? 0) > 0) {
-        durationsMs.add(_wavChunkDur!.inMilliseconds);
+      if (i == _chunkIndex && wavDurMs > 0) {
+        durationsMs.add(wavDurMs);
       } else {
         durationsMs.add(_estimatedSherpaChunkDuration(_queue[i]).inMilliseconds);
       }
     }
     final totalMs = durationsMs.fold<int>(0, (a, b) => a + b);
+
+    _cachedTimelinePage = pageNum;
+    _cachedTimelineIndices = indices;
+    _cachedTimelineDurationsMs = durationsMs;
+    _cachedTimelineTotalMs = totalMs;
+    _cachedTimelineQueueLen = _queue.length;
+    _cachedTimelineChunkIndex = _chunkIndex;
+    _cachedTimelineWavDurMs = wavDurMs;
+
     return (indices: indices, durationsMs: durationsMs, totalMs: totalMs);
   }
 
@@ -2121,6 +2199,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   Future<void> _commitPageTimelineScrub(double pageFrac) async {
     if (!mounted || !_isPlaying || _queue.isEmpty) return;
     if (_chunkIndex >= _queue.length) return;
+    final commitToken = ++_scrubCommitToken;
     final page = _queue[_chunkIndex].page;
     final timeline = _pageAudioTimeline(page);
     if (timeline.indices.isEmpty || timeline.totalMs <= 0) return;
@@ -2145,6 +2224,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
           await VaultReadingAudio.handler?.seek(
             Duration(milliseconds: within),
           );
+          if (!mounted || commitToken != _scrubCommitToken) return;
           _wavChunkPos = Duration(milliseconds: within);
           if (mounted && _shouldUpdateReadAlongUi) {
             final frac = dur <= 0 ? 0.0 : within / dur;
@@ -2162,10 +2242,26 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         final frac = dur <= 0 ? 0.0 : within / dur;
         final trim = (c.text.length * frac).floor().clamp(0, c.text.length);
         final safeTrim = trim >= c.text.length ? max(0, c.text.length - 1) : trim;
+        final charOffset = c.offsetInPage + safeTrim;
+
+        if (_queue.length > _kQueueReanchorChunkThreshold ||
+            (_queue.isNotEmpty &&
+                (c.page < _queue.first.page || c.page > _queue.last.page))) {
+          _cancelSherpaPipeline();
+          _reanchorInFlight = _reanchorPlaybackToPage(
+            c.page,
+            charOffset: charOffset,
+            interruptIfPlaying: true,
+          );
+          await _reanchorInFlight;
+          _reanchorInFlight = null;
+          return;
+        }
+
+        if (commitToken != _scrubCommitToken) return;
+        _cancelSherpaPipeline();
         _pendingJumpChunk = idx;
         _pendingSpeakStartInChunk = safeTrim > 0 ? safeTrim : null;
-        _bumpReadingPrefetchGen();
-        _clearSherpaPrefetchFutures();
         _interruptChunkPlayback();
         return;
       }
@@ -2387,14 +2483,24 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                           ? null
                           : (v) {
                             _pageTimelineFraction = v.clamp(0.0, 1.0);
+                            final now = DateTime.now();
+                            if (_lastScrubUiTick != null &&
+                                now.difference(_lastScrubUiTick!).inMilliseconds <
+                                    _kScrubUiThrottleMs) {
+                              return;
+                            }
+                            _lastScrubUiTick = now;
                             setState(() {});
                           },
                   onChangeEnd:
                       totalMs <= 0
                           ? (_) {
+                            _lastScrubUiTick = null;
                             setState(() => _pageTimelineScrubbing = false);
                           }
                           : (v) async {
+                            _scrubCommitToken++;
+                            _lastScrubUiTick = null;
                             final target = v.clamp(0.0, 1.0);
                             setState(() => _pageTimelineScrubbing = false);
                             await _commitPageTimelineScrub(target);
@@ -2505,11 +2611,13 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                       const SizedBox(width: 8),
                       _PlaybackCircleButton(
                         kind: _PlaybackBtnKind.segmentSkip,
-                        icon: Icons.fast_rewind_rounded,
-                        tooltip: 'Trecho anterior',
+                        icon: Icons.replay_5_rounded,
+                        tooltip: 'Voltar $_kReadingTimeSkipSeconds segundos',
                         onPressed:
-                            _isPlaying && _chunkIndex > 0
-                                ? _seekPreviousSegment
+                            _isPlaying
+                                ? () => unawaited(
+                                  _seekReadingSeconds(-_kReadingTimeSkipSeconds),
+                                )
                                 : null,
                       ),
                       const SizedBox(width: 12),
@@ -2535,9 +2643,14 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                       const SizedBox(width: 8),
                       _PlaybackCircleButton(
                         kind: _PlaybackBtnKind.segmentSkip,
-                        icon: Icons.fast_forward_rounded,
-                        tooltip: 'Trecho seguinte',
-                        onPressed: _isPlaying ? _seekNextSegment : null,
+                        icon: Icons.forward_5_rounded,
+                        tooltip: 'Avançar $_kReadingTimeSkipSeconds segundos',
+                        onPressed:
+                            _isPlaying
+                                ? () => unawaited(
+                                  _seekReadingSeconds(_kReadingTimeSkipSeconds),
+                                )
+                                : null,
                       ),
                       const SizedBox(width: 8),
                       _PlaybackCircleButton(
@@ -2673,7 +2786,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _awaitingStickyLineTap = false;
     _paused = false;
     _completeResumeWaitIfAny();
-    _bumpReadingPrefetchGen();
+    _cancelSherpaPipeline();
     _vaultAudioStopSub?.cancel();
     _vaultSegmentSkipSub?.cancel();
     _wavProgressSub?.cancel();

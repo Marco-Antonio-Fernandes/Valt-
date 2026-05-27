@@ -27,6 +27,11 @@ const Map<String, String> _bundledPtBrVoices = {
   'pt_br-jeff-medium': 'assets/tts/pt_BR/jeff/medium/',
 };
 
+/// Síntese interrompida por scrub/pausa — não é erro fatal da leitura.
+class TtsSynthesisCancelled implements Exception {
+  const TtsSynthesisCancelled();
+}
+
 /// Vozes Piper: pt_BR bundled no APK + outras descarregadas do servidor.
 /// Cada pasta em `vault_sherpa_tts_v12/{voice_key}/` contém `.onnx` + `.onnx.json`;
 /// tokens gerados automaticamente a partir do `phoneme_id_map`.
@@ -389,12 +394,27 @@ class TtsService {
     );
   }
 
+  /// Cancela pedidos em fila e reinicia o isolate — evita CPU presa após scrub/pausa.
+  Future<void> cancelPendingSynthesis() async {
+    if (kIsWeb) return;
+    for (final c in _ttsPending.values) {
+      if (!c.isCompleted) {
+        c.completeError(const TtsSynthesisCancelled());
+      }
+    }
+    _ttsPending.clear();
+    final model = _workerLoadedModel;
+    if (model == null || _ttsWorkerSend == null) return;
+    _shutdownTtsWorker();
+    await initTts(model);
+  }
+
   /// Gera WAV sem interromper o áudio atual — corre num isolate (não trava a UI).
   Future<String> prepareWavForText(String text) async {
     if (kIsWeb) {
       throw StateError('Sherpa ONNX não está disponível na web.');
     }
-    final worker = _ttsWorkerSend;
+    var worker = _ttsWorkerSend;
     if (worker == null) {
       throw StateError('TtsService.initTts antes de speak');
     }
