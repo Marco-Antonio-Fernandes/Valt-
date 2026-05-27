@@ -81,7 +81,6 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   var _paused = false;
   Completer<void>? _resumeCompleter;
 
-  var _autoContinue = true;
   final List<_Chunk> _queue = [];
   /// Texto por página (índices alinhados com [PdfPageText] para destaque no PDF).
   final Map<int, String> _pageTextFromQueue = {};
@@ -412,7 +411,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     if (pageText == null) return;
     final now = DateTime.now();
     if (_lastProgressRedraw != null &&
-        now.difference(_lastProgressRedraw!).inMilliseconds < 110) {
+        now.difference(_lastProgressRedraw!).inMilliseconds < 170) {
       return;
     }
     _lastProgressRedraw = now;
@@ -803,8 +802,6 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         _queue.length <= maxChunkIndexInclusive) {
       if (safety-- <= 0) break;
 
-      if (!_autoContinue) return;
-
       if (tp == null) return;
 
       final basePage = _queue.isEmpty ? (_currentPage - 1) : _queue.last.page;
@@ -823,6 +820,22 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         splitParagraphs: !isSherpaOffline,
       );
     }
+  }
+
+  /// Mantém sempre a página seguinte na fila, mesmo quando a atual tem muitos
+  /// segmentos — sem isto só se pedia próxima página no último chunk (delay lá).
+  Future<void> _ensureNextReadingPageQueued(int readingPage) async {
+    if (!mounted) return;
+    final tp = _totalPages;
+    if (tp == null) return;
+    final next = readingPage + 1;
+    if (next > tp) return;
+    if (_pagesMaterializedIntoQueue.contains(next)) return;
+    await _materializePageIntoQueue(
+      next,
+      chunkMax: isSherpaOffline ? 20000 : 3000,
+      splitParagraphs: !isSherpaOffline,
+    );
   }
 
   void _paintReadAloudHighlight(ui.Canvas canvas, Rect pageRect, PdfPage page) {
@@ -1400,9 +1413,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     );
     if (!mounted) return;
 
-    if (_autoContinue &&
-        _totalPages != null &&
-        start < _totalPages!) {
+    if (_totalPages != null && start < _totalPages!) {
       await _materializePageIntoQueue(
         start + 1,
         chunkMax: chunkMax,
@@ -1490,7 +1501,11 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
       if (_pendingSkipForwardChunk) return;
 
-      final completed = utteranceNaturallyCompleted;
+      // Com `awaitSpeakCompletion(true)`, o Future de `speak` já sincroniza com o fim
+      // do áudio — mas o completion handler no Android falha muito; isso repetia o
+      // mesmo trecho em loop. Se não estamos em pausa quando `speak` termina, tratar
+      // como conclusão natural (pausa a meio mantém `completed` falso para repetir).
+      final completed = utteranceNaturallyCompleted || !_paused;
 
       if (_paused) {
         _resumeCompleter = Completer<void>();
@@ -1520,6 +1535,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
         final g0 = _readingPrefetchGeneration;
         final c = _queue[_chunkIndex];
+        await _ensureNextReadingPageQueued(c.page);
         if (!mounted || !_isPlaying) break;
 
         await _syncViewerToReadingPage(c.page);
@@ -2507,48 +2523,6 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                 ),
               ),
             ],
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: Theme.of(context)
-                      .colorScheme
-                      .surfaceContainerHighest
-                      .withValues(alpha: 0.82),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .outline
-                        .withValues(alpha: 0.35),
-                  ),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.only(left: 10),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        'Seguir págs.',
-                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .onSurfaceVariant,
-                              fontWeight: FontWeight.w600,
-                            ),
-                      ),
-                      Switch(
-                        materialTapTargetSize:
-                            MaterialTapTargetSize.shrinkWrap,
-                        value: _autoContinue,
-                        onChanged: (v) =>
-                            setState(() => _autoContinue = v),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
           ],
         ),
         body: _loadError != null

@@ -1,7 +1,7 @@
 workflows:
   ios-debug-unsigned:
     name: iOS Debug IPA (sem code signing)
-    instance_type: mac_mini_m1
+    instance_type: mac_mini_m2
     max_build_duration: 60
     environment:
       flutter: stable
@@ -11,16 +11,34 @@ workflows:
         script: |
           set -e
           flutter pub get
-          flutter build ios --debug --no-codesign
+          
+          # 1. Apenas prepara os arquivos nativos na pasta /ios e para antes de dar erro
+          flutter build ios --debug --no-codesign --config-only
+          
+          # 2. Força o Xcode a compilar tudo desativando as travas de assinatura
+          cd ios
+          xcodebuild -workspace Runner.xcworkspace \
+                     -scheme Runner \
+                     -configuration Debug \
+                     -sdk iphoneos \
+                     CODE_SIGNING_ALLOWED=NO \
+                     CODE_SIGNING_REQUIRED=NO \
+                     CODE_SIGN_IDENTITY="" \
+                     OBJROOT=$PWD/build/ObjDump \
+                     SYMROOT=$PWD/build/SymDump
       - name: Empacotar Payload em Valt-Debug.ipa
         script: |
           set -e
           ROOT="${CM_BUILD_DIR:-$PWD}"
-          IOS_APP="$ROOT/build/ios/iphoneos"
+          
+          # Aponta para a pasta onde o Xcode salvou o Runner.app bruto
+          IOS_APP="$ROOT/ios/build/SymDump/Debug-iphoneos"
+          
           cd "$IOS_APP"
           rm -rf Payload
           mkdir Payload
           cp -R Runner.app Payload/
+          
           rm -f "$ROOT/Valt-Debug.ipa"
           zip -r "$ROOT/Valt-Debug.ipa" Payload
     artifacts:
