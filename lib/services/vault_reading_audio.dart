@@ -39,6 +39,15 @@ class VaultReadingAudio {
 
   static bool get isReady => _handler != null;
 
+  /// Mantém foco de áudio com ecrã bloqueado / app em segundo plano.
+  static Future<void> ensurePlaybackSessionActive() async {
+    if (kIsWeb) return;
+    try {
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+    } catch (_) {}
+  }
+
   /// Enviado de [VaultReadingAudioHandler] para esta stream.
   static void _dispatchSegmentSkip(VaultReadingSegmentSkip s) {
     if (!_segmentSkipsCtrl.isClosed) _segmentSkipsCtrl.add(s);

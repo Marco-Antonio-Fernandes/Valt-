@@ -38,6 +38,10 @@ const _readHighlightFill = Color(0x991565C0);
 const _kSherpaPdfProgressMinRedrawMs = 130;
 /// Com leitura parada liberta `PdfPageText` longe da página atual (exceto grifos / vizinhas).
 const _kStructuredTextCacheNearbyPages = 2;
+/// Evita percorrer o PDF página a página ao saltar para o fim (travava a UI).
+const _kMaxSequentialQueuePageLoads = 2;
+/// Trechos Sherpa menores → saltar no fim da página não gera um WAV gigante.
+const _kSherpaTtsChunkMax = 5500;
 
 class PdfReadingModeScreen extends StatefulWidget {
   const PdfReadingModeScreen({
@@ -113,15 +117,29 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   Duration? _wavChunkPos;
   Duration? _wavChunkDur;
-  var _wavScrubbingSherpa = false;
-  var _wavScrubFraction = 0.0;
+  /// Arrastar a barra de progresso (timeline da página inteira, não só o WAV atual).
+  var _pageTimelineScrubbing = false;
+  var _pageTimelineFraction = 0.0;
 
   var _playbackVolume = 1.0;
   var _pendingBackChunk = false;
   /// Próximo trecho (media / comando) durante TTS sistema — pedido de avançar sem repetir áudio atual.
   var _pendingSkipForwardChunk = false;
   int? _pendingJumpChunk;
+  /// Dentro do trecho alvo: começar a falar daqui (tocar no fim da página).
+  int? _pendingSpeakStartInChunk;
   var _isGenerating = false;
+
+  Future<void>? _reanchorInFlight;
+  int _queueRebuildToken = 0;
+
+  AppLifecycleState _lifecycle = AppLifecycleState.resumed;
+
+  /// Destaque no PDF + setState: só com app visível (áudio segue com ecrã bloqueado).
+  bool get _shouldUpdateReadAlongUi =>
+      mounted &&
+      _lifecycle == AppLifecycleState.resumed &&
+      !_paused;
 
   final ReadingNotesStore _readingNotesStore = ReadingNotesStore();
   List<ReadingNote> _readingNotes = [];
@@ -184,8 +202,13 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _lifecycle = state;
     if (state == AppLifecycleState.detached) {
       _stopPlayback();
+      return;
+    }
+    if (_isPlaying && !kIsWeb) {
+      unawaited(VaultReadingAudio.ensurePlaybackSessionActive());
     }
   }
 
@@ -243,7 +266,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     if (!isSherpaOffline || kIsWeb || !VaultReadingAudio.isReady) return;
     _wavProgressSub?.cancel();
     _wavProgressSub = VaultReadingAudio.wavProgress.listen((tick) {
-      if (!mounted || !isSherpaOffline || !_isPlaying || _paused) return;
+      if (!mounted || !isSherpaOffline || !_isPlaying || !_shouldUpdateReadAlongUi) {
+        return;
+      }
       final pos = tick.$1;
       final d = tick.$2;
 
@@ -264,7 +289,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         _lastWavHighlightRedraw = now;
         if (!mounted) return;
         setState(() {
-          if (!_wavScrubbingSherpa &&
+          if (!_pageTimelineScrubbing &&
               _queue.isNotEmpty &&
               _chunkIndex < _queue.length) {
             final dm = (_wavChunkDur ?? Duration.zero).inMilliseconds;
@@ -331,7 +356,26 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   void _seekNextSegment() {
     if (!_isPlaying) return;
-    if (_chunkIndex >= _queue.length - 1) return;
+    final nextIdx = _chunkIndex + 1;
+    if (nextIdx >= _queue.length) {
+      if (_queue.isEmpty ||
+          _currentPage > _queue.last.page + 1) {
+        _reanchorInFlight = _reanchorPlaybackToPage(
+          _currentPage,
+          interruptIfPlaying: true,
+        );
+        return;
+      }
+      return;
+    }
+    if (_queue[nextIdx].page != _currentPage &&
+        (_queue[nextIdx].page - _currentPage).abs() > 2) {
+      _reanchorInFlight = _reanchorPlaybackToPage(
+        _currentPage,
+        interruptIfPlaying: true,
+      );
+      return;
+    }
     _pendingSkipForwardChunk = true;
     _interruptChunkPlayback();
   }
@@ -404,7 +448,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   }
 
   void _onFlutterTtsProgress(String text, int startOffset, int endOffset, String word) {
-    if (!mounted || _paused) return;
+    if (!mounted || !_shouldUpdateReadAlongUi) return;
     if (_queue.isEmpty || _chunkIndex >= _queue.length) return;
     final chunk = _queue[_chunkIndex];
     final pageText = _structuredByPage[chunk.page];
@@ -488,16 +532,30 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     );
   }
 
-  /// Mantém página visível = página da leitura; evita novo Play recarregar fila desde página antiga.
+  /// Mantém página visível = página da leitura; com ecrã bloqueado só atualiza índice (sem PDF).
   Future<void> _syncViewerToReadingPage(int pageNum) async {
     if (!mounted || pageNum < 1) return;
     if (_totalPages != null && pageNum > _totalPages!) return;
     if (pageNum == _currentPage) return;
+    if (!_shouldUpdateReadAlongUi) {
+      _currentPage = pageNum;
+      return;
+    }
     setState(() => _currentPage = pageNum);
     if (!_pdfController.isReady) return;
     try {
       await _pdfController.goToPage(pageNumber: pageNum);
     } catch (_) {}
+  }
+
+  void _applyChunkHighlightStartUi(_Chunk c) {
+    _applyReadHighlightChunkProgress(c, 0);
+    _flutterWordProgress = 0;
+    if (!_shouldUpdateReadAlongUi) return;
+    setState(() {});
+    if (_pdfController.isReady) {
+      _pdfController.invalidate();
+    }
   }
 
   /// Ao sair do ecrã: preferir o segmento da fila se existir leitura recente,
@@ -741,6 +799,117 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _pagesMaterializedIntoQueue.clear();
   }
 
+  bool _queueHasChunksForPage(int pageNum) {
+    for (final c in _queue) {
+      if (c.page == pageNum) return true;
+    }
+    return false;
+  }
+
+  int? _readingPageFromQueue() {
+    if (_chunkIndex < 0 || _chunkIndex >= _queue.length) return null;
+    return _queue[_chunkIndex].page;
+  }
+
+  /// Trecho + offset dentro do texto do trecho (saltar leitura na mesma página).
+  ({int chunkIndex, int trimInChunk}) _resolveJumpOnPage(
+    int pageNum,
+    int charOffset,
+  ) {
+    var lastOnPage = 0;
+    for (var i = 0; i < _queue.length; i++) {
+      final c = _queue[i];
+      if (c.page != pageNum) continue;
+      lastOnPage = i;
+      final start = c.offsetInPage;
+      final end = start + c.text.length;
+      if (charOffset >= start && charOffset < end) {
+        return (chunkIndex: i, trimInChunk: charOffset - start);
+      }
+    }
+    final c = _queue[lastOnPage];
+    final trim = (charOffset - c.offsetInPage).clamp(0, c.text.length);
+    final safeTrim = trim >= c.text.length ? 0 : trim;
+    return (chunkIndex: lastOnPage, trimInChunk: safeTrim);
+  }
+
+  _Chunk _chunkTrimmedForPlayback(_Chunk c, int trimInChunk) {
+    if (trimInChunk <= 0) return c;
+    final t = trimInChunk.clamp(0, c.text.length);
+    if (t <= 0 || t >= c.text.length) return c;
+    return _Chunk(c.page, c.text.substring(t), c.offsetInPage + t);
+  }
+
+  void _scheduleJumpToPageOffset(int pageNum, int charOffset) {
+    final target = _resolveJumpOnPage(pageNum, charOffset);
+    _bumpReadingPrefetchGen();
+    _clearSherpaPrefetchFutures();
+    _pendingJumpChunk = target.chunkIndex;
+    _pendingSpeakStartInChunk =
+        target.trimInChunk > 0 ? target.trimInChunk : null;
+  }
+
+  int _sherpaChunkMaxLen() => _kSherpaTtsChunkMax;
+
+  int _queueChunkMaxLen() => isSherpaOffline ? _sherpaChunkMaxLen() : 3000;
+
+  /// Reconstrói a fila só na página alvo (+ seguinte), em vez de carregar todas as intermediárias.
+  Future<void> _reanchorPlaybackToPage(
+    int pageNum, {
+    int charOffset = 0,
+    bool interruptIfPlaying = false,
+  }) async {
+    if (!mounted) return;
+    if (pageNum < 1) return;
+    if (_totalPages != null && pageNum > _totalPages!) return;
+
+    final token = ++_queueRebuildToken;
+    _bumpReadingPrefetchGen();
+    _clearSherpaPrefetchFutures();
+
+    if (interruptIfPlaying && _isPlaying) {
+      _interruptChunkPlayback();
+    }
+
+    _clearQueuedPlaybackState();
+
+    final chunkMax = _queueChunkMaxLen();
+    final splitParagraphs = !isSherpaOffline;
+
+    await _materializePageIntoQueue(
+      pageNum,
+      chunkMax: chunkMax,
+      splitParagraphs: splitParagraphs,
+    );
+    if (!mounted || token != _queueRebuildToken) return;
+
+    if (_totalPages != null && pageNum < _totalPages!) {
+      await _materializePageIntoQueue(
+        pageNum + 1,
+        chunkMax: chunkMax,
+        splitParagraphs: splitParagraphs,
+      );
+    }
+    if (!mounted || token != _queueRebuildToken) return;
+
+    final target = _resolveJumpOnPage(pageNum, charOffset);
+    _chunkIndex =
+        target.chunkIndex.clamp(0, max(0, _queue.length - 1));
+    _pendingSpeakStartInChunk =
+        target.trimInChunk > 0 ? target.trimInChunk : null;
+
+    if (_isPlaying) {
+      _pendingJumpChunk = _chunkIndex;
+      _pendingSkipForwardChunk = false;
+      _pendingBackChunk = false;
+    }
+  }
+
+  Future<void> _awaitReanchorIfAny() async {
+    final f = _reanchorInFlight;
+    if (f != null) await f;
+  }
+
   void _maybeTrimStructuredTextCache() {
     if (_isPlaying) return;
     final tp = _totalPages;
@@ -796,13 +965,35 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   /// Pré-carrega páginas à medida (não faz `loadStructuredText` no livro inteiro ao iniciar Play).
   Future<void> _ensureQueuedChunksExtendThrough(int maxChunkIndexInclusive) async {
     final tp = _totalPages;
-    var safety = (tp ?? 512) + 32;
+    if (tp == null) return;
+
+    if (_queue.isNotEmpty && maxChunkIndexInclusive >= _queue.length) {
+      final tailPage = _queue.last.page;
+      if (_currentPage > tailPage + 1) {
+        await _reanchorPlaybackToPage(
+          _currentPage,
+          interruptIfPlaying: false,
+        );
+        return;
+      }
+    }
+
+    var safety = (tp) + 32;
+    var pagesLoadedThisPass = 0;
     while (mounted &&
         maxChunkIndexInclusive >= 0 &&
         _queue.length <= maxChunkIndexInclusive) {
       if (safety-- <= 0) break;
 
-      if (tp == null) return;
+      if (_queue.isNotEmpty &&
+          pagesLoadedThisPass >= _kMaxSequentialQueuePageLoads &&
+          _currentPage > _queue.last.page + 1) {
+        await _reanchorPlaybackToPage(
+          _currentPage,
+          interruptIfPlaying: false,
+        );
+        return;
+      }
 
       final basePage = _queue.isEmpty ? (_currentPage - 1) : _queue.last.page;
       var probe = basePage + 1;
@@ -816,9 +1007,10 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
       await _materializePageIntoQueue(
         probe,
-        chunkMax: isSherpaOffline ? 20000 : 3000,
+        chunkMax: _queueChunkMaxLen(),
         splitParagraphs: !isSherpaOffline,
       );
+      pagesLoadedThisPass++;
     }
   }
 
@@ -833,7 +1025,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     if (_pagesMaterializedIntoQueue.contains(next)) return;
     await _materializePageIntoQueue(
       next,
-      chunkMax: isSherpaOffline ? 20000 : 3000,
+      chunkMax: _queueChunkMaxLen(),
       splitParagraphs: !isSherpaOffline,
     );
   }
@@ -1400,27 +1592,10 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   }
 
   Future<void> _fillQueue({int? fromPage}) async {
-    _clearQueuedPlaybackState();
-
-    final start = fromPage ?? _currentPage;
-    final chunkMax = isSherpaOffline ? 20000 : 3000;
-    final splitParagraphsMode = !isSherpaOffline;
-
-    await _materializePageIntoQueue(
-      start,
-      chunkMax: chunkMax,
-      splitParagraphs: splitParagraphsMode,
+    await _reanchorPlaybackToPage(
+      fromPage ?? _currentPage,
+      interruptIfPlaying: false,
     );
-    if (!mounted) return;
-
-    if (_totalPages != null && start < _totalPages!) {
-      await _materializePageIntoQueue(
-        start + 1,
-        chunkMax: chunkMax,
-        splitParagraphs: splitParagraphsMode,
-      );
-    }
-    await _ensureQueuedChunksExtendThrough(1);
   }
 
   Future<void> _play() async {
@@ -1523,40 +1698,48 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   }
 
   Future<void> _run() async {
-    final sherpaWake = isSherpaOffline && !kIsWeb;
-    if (sherpaWake) {
+    final keepAwake = !kIsWeb;
+    if (keepAwake) {
       await WakelockPlus.enable();
+      await VaultReadingAudio.ensurePlaybackSessionActive();
     }
     try {
       _clearSherpaPrefetchFutures();
       while (mounted && _isPlaying) {
+        await _awaitReanchorIfAny();
+        if (_pendingJumpChunk != null) {
+          _chunkIndex = _pendingJumpChunk!.clamp(0, max(0, _queue.length - 1));
+          _pendingJumpChunk = null;
+          _clearSherpaPrefetchFutures();
+        }
         await _ensureQueuedChunksExtendThrough(_chunkIndex + 1);
         if (_chunkIndex >= _queue.length) break;
 
         final g0 = _readingPrefetchGeneration;
         final c = _queue[_chunkIndex];
-        await _ensureNextReadingPageQueued(c.page);
-        if (!mounted || !_isPlaying) break;
-
-        await _syncViewerToReadingPage(c.page);
-        if (!mounted || !_isPlaying) break;
-
-        if (mounted) {
-          setState(() {
-            _applyReadHighlightChunkProgress(c, 0);
-            _flutterWordProgress = 0;
-          });
-          if (_pdfController.isReady) {
-            _pdfController.invalidate();
-          }
+        final trimInChunk = _pendingSpeakStartInChunk ?? 0;
+        _pendingSpeakStartInChunk = null;
+        final active = _chunkTrimmedForPlayback(c, trimInChunk);
+        if (active.text.trim().isEmpty) {
+          _chunkIndex++;
+          continue;
         }
+
+        final nextPagePrep = _ensureNextReadingPageQueued(active.page);
+        if (!mounted || !_isPlaying) break;
+
+        await _syncViewerToReadingPage(active.page);
+        if (!mounted || !_isPlaying) break;
+
+        _applyChunkHighlightStartUi(active);
 
         try {
           if (isSherpaOffline) {
-            var pref = _sherpaNextWav;
+            var pref = trimInChunk > 0 ? null : _sherpaNextWav;
             _sherpaNextWav = null;
 
             if (pref == null &&
+                trimInChunk == 0 &&
                 _sherpaSpareWav != null &&
                 _sherpaSpareForQueueIndex == _chunkIndex) {
               pref = _sherpaSpareWav;
@@ -1564,15 +1747,32 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
               _sherpaSpareForQueueIndex = null;
             }
 
+            if (trimInChunk > 0) {
+              _clearSherpaPrefetchFutures();
+            }
+
             final usePrefetch = pref != null;
-            if (mounted && !usePrefetch) {
+            if (mounted && _shouldUpdateReadAlongUi && !usePrefetch) {
               setState(() => _isGenerating = true);
             }
 
-            var wavPath = pref != null ? await pref : null;
-            wavPath ??= await _prepareSherpaWavIfActive(c.text, g0);
+            String? wavPath;
+            if (usePrefetch) {
+              wavPath = await pref;
+              await nextPagePrep;
+            } else {
+              final results = await Future.wait<Object?>([
+                nextPagePrep,
+                _prepareSherpaWavIfActive(active.text, g0),
+              ]);
+              wavPath = results[1] as String?;
+            }
 
-            if (mounted) setState(() => _isGenerating = false);
+            if (mounted && _shouldUpdateReadAlongUi) {
+              setState(() => _isGenerating = false);
+            } else {
+              _isGenerating = false;
+            }
 
             if (wavPath == null) {
               if (!mounted || !_isPlaying) break;
@@ -1606,12 +1806,14 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
               wavPath,
               volume: _playbackVolume,
               playbackSpeed: _wavPlaybackSpeed,
-              mediaTitle: _notificationTitleForChunk(c),
+              mediaTitle: _notificationTitleForChunk(active),
               mediaAlbum: widget.item.displayName,
               mediaArtUri: _coverArtUri(),
             );
           } else {
-            await _speakNormalizedChunkWithPauseResume(_normalizeTtsText(c.text));
+            await _speakNormalizedChunkWithPauseResume(
+              _normalizeTtsText(active.text),
+            );
           }
         } catch (e) {
           if (mounted) setState(() => _isGenerating = false);
@@ -1674,7 +1876,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         });
       }
     } finally {
-      if (sherpaWake) {
+      if (keepAwake) {
         await WakelockPlus.disable();
       }
     }
@@ -1683,69 +1885,37 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   // ─── Tap-to-jump ───
 
   Future<void> _jumpToCharOffset(int charOffset) async {
-    if (_pageTextFromQueue[_currentPage] == null) {
-      await _fillQueue(fromPage: _currentPage);
-    }
-    final pageFull = _pageTextFromQueue[_currentPage];
-    if (pageFull == null || pageFull.isEmpty) return;
+    final page = _currentPage;
+    final readingPage = _readingPageFromQueue();
+    final farFromQueue = readingPage != null && readingPage != page;
+    final needsReanchor =
+        !_queueHasChunksForPage(page) || farFromQueue;
 
-    // Se a fila já tem chunks da página atual, procurar o chunk certo
-    int? targetChunk;
-    for (var i = 0; i < _queue.length; i++) {
-      final c = _queue[i];
-      if (c.page != _currentPage) continue;
-      if (charOffset >= c.offsetInPage &&
-          charOffset < c.offsetInPage + c.text.length) {
-        targetChunk = i;
-        break;
+    if (needsReanchor) {
+      _reanchorInFlight = _reanchorPlaybackToPage(
+        page,
+        charOffset: charOffset,
+        interruptIfPlaying: _isPlaying,
+      );
+      await _reanchorInFlight;
+      _reanchorInFlight = null;
+      if (!mounted) return;
+      if (!_isPlaying) {
+        unawaited(_play());
       }
+      return;
     }
 
-    if (_isPlaying && targetChunk != null) {
-      _pendingJumpChunk = targetChunk;
+    if (_isPlaying) {
+      _scheduleJumpToPageOffset(page, charOffset);
       _interruptChunkPlayback();
-    } else if (targetChunk != null) {
-      _chunkIndex = targetChunk;
-      unawaited(_play());
     } else {
-      unawaited(_startPlayingFromOffset(charOffset));
+      final target = _resolveJumpOnPage(page, charOffset);
+      _chunkIndex = target.chunkIndex;
+      _pendingSpeakStartInChunk =
+          target.trimInChunk > 0 ? target.trimInChunk : null;
+      unawaited(_play());
     }
-  }
-
-  Future<void> _startPlayingFromOffset(int charOffset) async {
-    await _fillQueue();
-    var foundExact = false;
-    for (var i = 0; i < _queue.length; i++) {
-      final c = _queue[i];
-      if (c.page != _currentPage) continue;
-      if (charOffset >= c.offsetInPage &&
-          charOffset < c.offsetInPage + c.text.length) {
-        _chunkIndex = i;
-        foundExact = true;
-        break;
-      }
-    }
-    if (!foundExact) {
-      var anyOnPage = false;
-      for (var i = 0; i < _queue.length; i++) {
-        if (_queue[i].page == _currentPage) {
-          _chunkIndex = i;
-          anyOnPage = true;
-          break;
-        }
-      }
-      if (!anyOnPage) _chunkIndex = 0;
-    }
-    if (!mounted) return;
-
-    await _ensureSherpaInfrastructure();
-
-    setState(() {
-      _isPlaying = true;
-      _paused = false;
-      _clearHighlight();
-    });
-    await _run();
   }
 
   // ─── Playback controls ───
@@ -1759,7 +1929,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     _pendingBackChunk = false;
     _pendingSkipForwardChunk = false;
     _pendingJumpChunk = null;
-    _wavScrubbingSherpa = false;
+    _pendingSpeakStartInChunk = null;
+    _pageTimelineScrubbing = false;
     _wavChunkPos = null;
     _wavChunkDur = null;
     if (isSherpaOffline) {
@@ -1814,6 +1985,8 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       _completeResumeWaitIfAny();
       return;
     }
+    _bumpReadingPrefetchGen();
+    _clearSherpaPrefetchFutures();
     setState(() => _paused = true);
     if (isSherpaOffline) {
       unawaited(TtsService.instance.pauseReadingPlayback());
@@ -1882,8 +2055,123 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   String _notificationTitleForChunk(_Chunk c) =>
       _mediaChunkTitle(c.text, c.page);
 
-  String _progressStripLabel(_Chunk c) =>
-      'Trecho · pág. ${c.page}';
+  Duration _estimatedSherpaChunkDuration(_Chunk chunk) {
+    final n = max(1, chunk.text.length);
+    final speed = _wavPlaybackSpeed.clamp(0.65, 1.75);
+    const baseCharsPerSec = 14.0;
+    final secs =
+        ((n / (baseCharsPerSec * speed)).ceil()).clamp(2, 36000);
+    return Duration(seconds: secs);
+  }
+
+  /// Trechos da página na fila + duração estimada (WAV real no trecho atual).
+  ({List<int> indices, List<int> durationsMs, int totalMs}) _pageAudioTimeline(
+    int pageNum,
+  ) {
+    final indices = <int>[];
+    final durationsMs = <int>[];
+    for (var i = 0; i < _queue.length; i++) {
+      if (_queue[i].page != pageNum) continue;
+      indices.add(i);
+      if (i == _chunkIndex &&
+          (_wavChunkDur?.inMilliseconds ?? 0) > 0) {
+        durationsMs.add(_wavChunkDur!.inMilliseconds);
+      } else {
+        durationsMs.add(_estimatedSherpaChunkDuration(_queue[i]).inMilliseconds);
+      }
+    }
+    final totalMs = durationsMs.fold<int>(0, (a, b) => a + b);
+    return (indices: indices, durationsMs: durationsMs, totalMs: totalMs);
+  }
+
+  int _pageTimelinePositionMs(int pageNum) {
+    final t = _pageAudioTimeline(pageNum);
+    if (t.indices.isEmpty || t.totalMs <= 0) return 0;
+    var pos = 0;
+    for (var k = 0; k < t.indices.length; k++) {
+      final idx = t.indices[k];
+      final dur = t.durationsMs[k];
+      if (idx < _chunkIndex) {
+        pos += dur;
+      } else if (idx == _chunkIndex) {
+        if (_pageTimelineScrubbing) {
+          pos += (dur * _pageTimelineFraction).round();
+        } else {
+          final dm = _wavChunkDur?.inMilliseconds ?? 0;
+          if (dm > 0) {
+            pos += (_wavChunkPos ?? Duration.zero)
+                .inMilliseconds
+                .clamp(0, dm);
+          }
+        }
+        break;
+      }
+    }
+    return pos.clamp(0, t.totalMs);
+  }
+
+  double _livePageTimelineFraction() {
+    if (_queue.isEmpty || _chunkIndex >= _queue.length) return 0;
+    final page = _queue[_chunkIndex].page;
+    final t = _pageAudioTimeline(page);
+    if (t.totalMs <= 0) return 0;
+    return (_pageTimelinePositionMs(page) / t.totalMs).clamp(0.0, 1.0);
+  }
+
+  Future<void> _commitPageTimelineScrub(double pageFrac) async {
+    if (!mounted || !_isPlaying || _queue.isEmpty) return;
+    if (_chunkIndex >= _queue.length) return;
+    final page = _queue[_chunkIndex].page;
+    final timeline = _pageAudioTimeline(page);
+    if (timeline.indices.isEmpty || timeline.totalMs <= 0) return;
+
+    final targetMs =
+        (pageFrac.clamp(0.0, 1.0) * timeline.totalMs).round().clamp(
+          0,
+          timeline.totalMs,
+        );
+    var acc = 0;
+    for (var k = 0; k < timeline.indices.length; k++) {
+      final idx = timeline.indices[k];
+      final dur = timeline.durationsMs[k];
+      final end = acc + dur;
+      final isLast = k == timeline.indices.length - 1;
+      if (targetMs < end || isLast) {
+        final within = (targetMs - acc).clamp(0, dur);
+
+        if (idx == _chunkIndex &&
+            (_wavChunkDur?.inMilliseconds ?? 0) > 0 &&
+            VaultReadingAudio.isReady) {
+          await VaultReadingAudio.handler?.seek(
+            Duration(milliseconds: within),
+          );
+          _wavChunkPos = Duration(milliseconds: within);
+          if (mounted && _shouldUpdateReadAlongUi) {
+            final frac = dur <= 0 ? 0.0 : within / dur;
+            setState(() {
+              _applyReadHighlightChunkProgress(_queue[idx], frac);
+            });
+            if (_pdfController.isReady) {
+              _pdfController.invalidate();
+            }
+          }
+          return;
+        }
+
+        final c = _queue[idx];
+        final frac = dur <= 0 ? 0.0 : within / dur;
+        final trim = (c.text.length * frac).floor().clamp(0, c.text.length);
+        final safeTrim = trim >= c.text.length ? max(0, c.text.length - 1) : trim;
+        _pendingJumpChunk = idx;
+        _pendingSpeakStartInChunk = safeTrim > 0 ? safeTrim : null;
+        _bumpReadingPrefetchGen();
+        _clearSherpaPrefetchFutures();
+        _interruptChunkPlayback();
+        return;
+      }
+      acc = end;
+    }
+  }
 
   String _formatShortDuration(Duration d) {
     final totalMs = max(0, d.inMilliseconds);
@@ -2050,22 +2338,21 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       );
     }
 
-    final dmRaw = (_wavChunkDur ?? Duration.zero).inMilliseconds;
-    double fracLive = 0;
-    if (dmRaw > 0) {
-      final pmRaw = (_wavChunkPos ?? Duration.zero).inMilliseconds;
-      fracLive = (pmRaw / dmRaw.toDouble()).clamp(0.0, 1.0);
-    }
-    final frac =
-        (_wavScrubbingSherpa ? _wavScrubFraction : fracLive).clamp(0.0, 1.0);
-    final elapsed =
-        Duration(milliseconds: dmRaw <= 0 ? 0 : (frac * dmRaw).round());
+    final page = chunk.page;
+    final timeline = _pageAudioTimeline(page);
+    final totalMs = timeline.totalMs;
+    final frac = (_pageTimelineScrubbing
+            ? _pageTimelineFraction
+            : _livePageTimelineFraction())
+        .clamp(0.0, 1.0);
+    final elapsedMs = totalMs <= 0 ? 0 : (frac * totalMs).round();
+    final remainingMs = max(0, totalMs - elapsedMs);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          _progressStripLabel(chunk),
+          'Página $page · arraste para avançar ou voltar na leitura',
           style:
               Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
         ),
@@ -2073,7 +2360,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
         Row(
           children: [
             Text(
-              dmRaw <= 0 ? '—' : _formatShortDuration(elapsed),
+              totalMs <= 0 ? '—' : _formatShortDuration(Duration(milliseconds: elapsedMs)),
               style:
                   Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
             ),
@@ -2087,63 +2374,38 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                 child: Slider(
                   value: frac,
                   onChangeStart:
-                      dmRaw <= 0
+                      totalMs <= 0
                           ? null
                           : (_) {
                             setState(() {
-                              _wavScrubbingSherpa = true;
-                              _wavScrubFraction =
-                                  ((_wavChunkPos ?? Duration.zero)
-                                              .inMilliseconds /
-                                          dmRaw)
-                                      .clamp(0.0, 1.0);
-                              if (_chunkIndex < _queue.length) {
-                                _applyReadHighlightChunkProgress(
-                                  _queue[_chunkIndex],
-                                  _wavScrubFraction,
-                                );
-                              }
+                              _pageTimelineScrubbing = true;
+                              _pageTimelineFraction = _livePageTimelineFraction();
                             });
                           },
                   onChanged:
-                      dmRaw <= 0
+                      totalMs <= 0
                           ? null
-                          : (v) => setState(() {
-                            _wavScrubFraction = v.clamp(0.0, 1.0);
-                            if (_chunkIndex < _queue.length) {
-                              _applyReadHighlightChunkProgress(
-                                _queue[_chunkIndex],
-                                _wavScrubFraction,
-                              );
-                            }
-                          }),
+                          : (v) {
+                            _pageTimelineFraction = v.clamp(0.0, 1.0);
+                            setState(() {});
+                          },
                   onChangeEnd:
-                      dmRaw <= 0
+                      totalMs <= 0
                           ? (_) {
-                            setState(() => _wavScrubbingSherpa = false);
+                            setState(() => _pageTimelineScrubbing = false);
                           }
-                          : (_) async {
-                            final ms =
-                                ((_wavScrubFraction * dmRaw).round()).clamp(
-                              0,
-                              dmRaw,
-                            );
-                            await VaultReadingAudio.handler?.seek(
-                              Duration(milliseconds: ms),
-                            );
-                            if (mounted) {
-                              setState(() {
-                                _wavScrubbingSherpa = false;
-                              });
-                            }
+                          : (v) async {
+                            final target = v.clamp(0.0, 1.0);
+                            setState(() => _pageTimelineScrubbing = false);
+                            await _commitPageTimelineScrub(target);
                           },
                 ),
               ),
             ),
             Text(
-              dmRaw <= 0
+              totalMs <= 0
                   ? '—'
-                  : _formatShortDuration(Duration(milliseconds: dmRaw)),
+                  : _formatShortDuration(Duration(milliseconds: remainingMs)),
               style:
                   Theme.of(context).textTheme.labelSmall?.copyWith(color: muted),
             ),
@@ -2409,7 +2671,6 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   @override
   void dispose() {
     _awaitingStickyLineTap = false;
-    ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
     _paused = false;
     _completeResumeWaitIfAny();
     _bumpReadingPrefetchGen();
@@ -2425,6 +2686,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
       unawaited(TtsService.instance.stop());
     } else {
       unawaited(_tts.stop());
+    }
+    if (!kIsWeb) {
+      unawaited(WakelockPlus.disable());
     }
     super.dispose();
   }
@@ -2564,6 +2828,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                       onPageChanged: (n) {
                         if (n == null || n == _currentPage) return;
                         final wasPlaying = _isPlaying;
+                        final readingPage = _readingPageFromQueue();
                         if (!wasPlaying) {
                           _clearQueuedPlaybackState();
                           _chunkIndex = 0;
@@ -2575,6 +2840,12 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                             if (!mounted) return;
                             _maybeTrimStructuredTextCache();
                           });
+                        } else if (readingPage != null &&
+                            (n - readingPage).abs() > 1) {
+                          _reanchorInFlight = _reanchorPlaybackToPage(
+                            n,
+                            interruptIfPlaying: true,
+                          );
                         }
                       },
                     ),
