@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:showcaseview/showcaseview.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_theme.dart';
@@ -21,6 +22,7 @@ import '../services/piper_voice_service.dart';
 import '../services/reading_notes_store.dart';
 import '../services/tts_service.dart' show TtsService, TtsSynthesisCancelled;
 import '../services/vault_reading_audio.dart';
+import '../tutorial/vault_reader_tutorial.dart';
 import '../widgets/pdf_sticky_notes.dart';
 import '../widgets/reading_highlight_color_sheet.dart';
 import '../widgets/reading_highlights_paint.dart';
@@ -54,10 +56,14 @@ class PdfReadingModeScreen extends StatefulWidget {
     super.key,
     required this.item,
     this.onPagePersist,
+    this.runTutorialOnStart = false,
+    this.onTutorialFinished,
   });
 
   final LibraryItem item;
   final void Function(int lastPageIndex, {int? totalPages})? onPagePersist;
+  final bool runTutorialOnStart;
+  final VoidCallback? onTutorialFinished;
 
   @override
   State<PdfReadingModeScreen> createState() => _PdfReadingModeScreenState();
@@ -167,6 +173,9 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
   var _readAloudEngine = 'system';
   var _sherpaOfflineVoice = 'pt_br-faber-medium';
 
+  VaultReaderTutorial? _readerTutorial;
+  var _readerTutorialStarted = false;
+
   bool get isSherpaOffline => _readAloudEngine == 'sherpa' && !kIsWeb;
   String get sherpaVoiceId => _sherpaOfflineVoice;
 
@@ -192,6 +201,98 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
     });
     unawaited(_bootstrapTts());
     unawaited(_reloadReadingNotesForItem());
+    if (widget.runTutorialOnStart) {
+      _setupReaderTutorial();
+    }
+  }
+
+  void _setupReaderTutorial() {
+    final t = VaultReaderTutorial();
+    _readerTutorial = t;
+    void finish() => widget.onTutorialFinished?.call();
+    t.register(onFinish: finish, onDismiss: (_) => finish());
+  }
+
+  void _maybeStartReaderTutorial() {
+    if (_readerTutorialStarted ||
+        !widget.runTutorialOnStart ||
+        _readerTutorial == null ||
+        !_viewerReady ||
+        _loadError != null) {
+      return;
+    }
+    _readerTutorialStarted = true;
+    _readerTutorial!.start();
+  }
+
+  Widget _wrapReaderTutorialListenHint(Widget child) {
+    final t = _readerTutorial;
+    if (t == null) return child;
+    return t.wrap(
+      showcaseKey: t.listenHintKey,
+      title: 'Como ouvir',
+      description:
+          'Toca numa linha do PDF para começar a ler a partir daí. '
+          'Também podes usar o botão play na barra inferior.',
+      tooltipPosition: TooltipPosition.bottom,
+      child: child,
+    );
+  }
+
+  Widget _wrapReaderTutorialPlay(Widget child) {
+    final t = _readerTutorial;
+    if (t == null) return child;
+    return t.wrap(
+      showcaseKey: t.playKey,
+      title: 'Controlos de leitura',
+      description:
+          'Play inicia ou retoma; pause interrompe; stop termina. '
+          'Usa as setas para mudar de página e ±5 s para saltar no áudio.',
+      tooltipPosition: TooltipPosition.top,
+      child: child,
+    );
+  }
+
+  Widget _wrapReaderTutorialVoice(Widget child) {
+    final t = _readerTutorial;
+    if (t == null) return child;
+    return t.wrap(
+      showcaseKey: t.voiceKey,
+      title: 'Escolher voz',
+      description:
+          'Abre o painel de vozes: voz do telemóvel ou vozes offline Vault. '
+          'Toca em «Gerir vozes» para descarregar mais vozes Piper em português.',
+      tooltipPosition: TooltipPosition.bottom,
+      child: child,
+    );
+  }
+
+  Widget _wrapReaderTutorialSticky(Widget child) {
+    final t = _readerTutorial;
+    if (t == null) return child;
+    return t.wrap(
+      showcaseKey: t.stickyKey,
+      title: 'Notas de rodapé',
+      description:
+          'Cria notas amarelas ligadas a uma linha do texto. '
+          'Toca no ícone, depois numa linha do PDF, e escreve a tua anotação.',
+      tooltipPosition: TooltipPosition.bottom,
+      child: child,
+    );
+  }
+
+  Widget _wrapReaderTutorialBookmarks(Widget child) {
+    final t = _readerTutorial;
+    if (t == null) return child;
+    return t.wrap(
+      showcaseKey: t.bookmarksKey,
+      title: 'Grifos e marcadores',
+      description:
+          'Selecciona texto no PDF e escolhe «Grifar e guardar» no menu. '
+          'Este ícone lista todas as notas e grifos guardados neste livro.',
+      tooltipPosition: TooltipPosition.bottom,
+      child: child,
+    );
   }
 
   Future<void> _reloadReadingNotesForItem() async {
@@ -2621,17 +2722,19 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                                 : null,
                       ),
                       const SizedBox(width: 12),
-                      _PlaybackCircleButton(
-                        kind: _PlaybackBtnKind.playPrimary,
-                        icon: _isPlaying && !_paused
-                            ? Icons.pause_rounded
-                            : Icons.play_arrow_rounded,
-                        tooltip: !_isPlaying
-                            ? 'Começar leitura'
-                            : (_paused
-                                ? 'Continuar leitura'
-                                : 'Pausar leitura'),
-                        onPressed: _onTogglePlayPause,
+                      _wrapReaderTutorialPlay(
+                        _PlaybackCircleButton(
+                          kind: _PlaybackBtnKind.playPrimary,
+                          icon: _isPlaying && !_paused
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                          tooltip: !_isPlaying
+                              ? 'Começar leitura'
+                              : (_paused
+                                  ? 'Continuar leitura'
+                                  : 'Pausar leitura'),
+                          onPressed: _onTogglePlayPause,
+                        ),
                       ),
                       const SizedBox(width: 12),
                       _PlaybackCircleButton(
@@ -2783,6 +2886,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
 
   @override
   void dispose() {
+    _readerTutorial?.dispose();
     _awaitingStickyLineTap = false;
     _paused = false;
     _completeResumeWaitIfAny();
@@ -2866,35 +2970,41 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                     ),
                   ),
               ],
-              IconButton(
-                tooltip:
-                    'Marcadores — notas e grifos guardados neste PDF',
-                icon: const Icon(Icons.bookmarks_outlined),
-                onPressed: (!_viewerReady || _loadError != null)
-                    ? null
-                    : () => unawaited(_openReadingBookmarksSheet()),
+              _wrapReaderTutorialBookmarks(
+                IconButton(
+                  tooltip:
+                      'Marcadores — notas e grifos guardados neste PDF',
+                  icon: const Icon(Icons.bookmarks_outlined),
+                  onPressed: (!_viewerReady || _loadError != null)
+                      ? null
+                      : () => unawaited(_openReadingBookmarksSheet()),
+                ),
               ),
-              IconButton(
-                tooltip: _awaitingStickyLineTap
-                    ? 'Cancelar (premir de novo)'
-                    : 'Nota de rodapé — liga ao texto ao tocar numa linha',
-                icon: const Icon(Icons.sticky_note_2_rounded),
-                onPressed:
-                    (_viewerReady && _loadError == null)
-                        ? _offerAddStickyNote
-                        : null,
+              _wrapReaderTutorialSticky(
+                IconButton(
+                  tooltip: _awaitingStickyLineTap
+                      ? 'Cancelar (premir de novo)'
+                      : 'Nota de rodapé — liga ao texto ao tocar numa linha',
+                  icon: const Icon(Icons.sticky_note_2_rounded),
+                  onPressed:
+                      (_viewerReady && _loadError == null)
+                          ? _offerAddStickyNote
+                          : null,
+                ),
               ),
               Padding(
                 padding: const EdgeInsets.only(right: 6),
-                child: FilledButton.tonalIcon(
-                  onPressed: _openVoiceSheet,
-                  icon: const Icon(Icons.record_voice_over_rounded, size: 20),
-                  label: const Text('Voz'),
-                  style: FilledButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
+                child: _wrapReaderTutorialVoice(
+                  FilledButton.tonalIcon(
+                    onPressed: _openVoiceSheet,
+                    icon: const Icon(Icons.record_voice_over_rounded, size: 20),
+                    label: const Text('Voz'),
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
                     ),
                   ),
                 ),
@@ -2937,6 +3047,7 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                           _currentPage = _currentPage.clamp(1, count);
                         });
                         _persistPage();
+                        _maybeStartReaderTutorial();
                       },
                       onPageChanged: (n) {
                         if (n == null || n == _currentPage) return;
@@ -2973,60 +3084,62 @@ class _PdfReadingModeScreenState extends State<PdfReadingModeScreen>
                       right: 16,
                       top: 10,
                       child: IgnorePointer(
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(14),
-                            gradient: LinearGradient(
-                              colors: [
-                                Colors.black.withValues(alpha: 0.72),
-                                Colors.black.withValues(alpha: 0.52),
-                              ],
-                            ),
-                            border: Border.all(
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .primary
-                                  .withValues(alpha: 0.35),
-                            ),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.35),
-                                blurRadius: 18,
-                                offset: const Offset(0, 6),
+                        child: _wrapReaderTutorialListenHint(
+                          DecoratedBox(
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(14),
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.black.withValues(alpha: 0.72),
+                                  Colors.black.withValues(alpha: 0.52),
+                                ],
                               ),
-                            ],
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 11,
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons.touch_app_rounded,
-                                  size: 18,
-                                  color: Theme.of(context).colorScheme.primary,
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    'Toca no texto do PDF para ouvir a partir daí',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .labelMedium
-                                        ?.copyWith(
-                                          color: Colors.white.withValues(
-                                            alpha: 0.94,
-                                          ),
-                                          height: 1.25,
-                                          fontWeight: FontWeight.w500,
-                                        ),
-                                    textAlign: TextAlign.center,
-                                  ),
+                              border: Border.all(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .primary
+                                    .withValues(alpha: 0.35),
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.35),
+                                  blurRadius: 18,
+                                  offset: const Offset(0, 6),
                                 ),
                               ],
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 11,
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.touch_app_rounded,
+                                    size: 18,
+                                    color: Theme.of(context).colorScheme.primary,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      'Toca no texto do PDF para ouvir a partir daí',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .labelMedium
+                                          ?.copyWith(
+                                            color: Colors.white.withValues(
+                                              alpha: 0.94,
+                                            ),
+                                            height: 1.25,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),

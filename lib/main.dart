@@ -6,8 +6,8 @@ import 'package:flutter/services.dart';
 import 'package:pdfrx/pdfrx.dart';
 
 import 'app_theme.dart';
-import 'screens/library_screen.dart';
 import 'screens/startup_loading_screen.dart';
+import 'screens/vault_session_gate.dart';
 import 'services/download_complete_notifier.dart';
 import 'services/vault_android_permissions.dart';
 
@@ -90,7 +90,7 @@ class _VaultAppState extends State<VaultApp> {
       color: AppTheme.black,
       home:
           _startupReady
-              ? const LibraryScreen()
+              ? const VaultSessionGate()
               : StartupLoadingScreen(
                   errorMessage: _startupError,
                   onRetry: _startupError != null ? () => unawaited(_runStartup()) : null,

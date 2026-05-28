@@ -46,9 +46,8 @@ class VaultAuthApi {
   }
 
   Future<VaultAuthSession> register({
-    required String email,
+    required String apelido,
     required String password,
-    required String displayName,
   }) async {
     final uri = VaultBackendConfig.rootUri('/auth/register');
     final res = await _withTimeout(
@@ -56,9 +55,8 @@ class VaultAuthApi {
         uri,
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
-          'email': email.trim(),
+          'apelido': apelido.trim(),
           'password': password,
-          'display_name': displayName.trim(),
         }),
       ),
     );
@@ -69,7 +67,7 @@ class VaultAuthApi {
   }
 
   Future<VaultAuthSession> login({
-    required String email,
+    required String apelido,
     required String password,
   }) async {
     final uri = VaultBackendConfig.rootUri('/auth/login');
@@ -77,7 +75,7 @@ class VaultAuthApi {
       _client.post(
         uri,
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'email': email.trim(), 'password': password}),
+        body: jsonEncode({'apelido': apelido.trim(), 'password': password}),
       ),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {

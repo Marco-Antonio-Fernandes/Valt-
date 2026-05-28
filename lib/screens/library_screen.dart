@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
+import 'package:showcaseview/showcaseview.dart';
 
 import '../app_theme.dart';
 import '../models/library_item.dart';
@@ -15,6 +16,7 @@ import '../services/library_store.dart';
 import '../services/vault_android_permissions.dart';
 import '../services/vault_auth_api.dart';
 import '../services/vault_auth_store.dart';
+import '../services/vault_tutorial_store.dart';
 import '../utils/comic_name_parser.dart';
 import '../widgets/local_cover_image.dart';
 import 'comic_reader_screen.dart';
@@ -22,9 +24,23 @@ import 'pdf_reading_mode_screen.dart';
 import 'pdf_reader_screen.dart';
 import 'account_screen.dart';
 import 'saga_detail_screen.dart';
+import '../tutorial/vault_app_tutorial.dart';
 
 class LibraryScreen extends StatefulWidget {
-  const LibraryScreen({super.key});
+  const LibraryScreen({
+    super.key,
+    required this.authApi,
+    required this.authStore,
+    this.runTutorialOnStart = false,
+    this.onTutorialFinished,
+    this.onSessionEnded,
+  });
+
+  final VaultAuthApi authApi;
+  final VaultAuthStore authStore;
+  final bool runTutorialOnStart;
+  final VoidCallback? onTutorialFinished;
+  final VoidCallback? onSessionEnded;
 
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
@@ -36,8 +52,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   List<LibraryItem> _items = [];
   var _loading = true;
   var _tabIndex = 0;
-  final _vaultAuthApi = VaultAuthApi();
-  final _vaultAuthStore = VaultAuthStore();
+  VaultAppTutorial? _tutorial;
 
   static bool get _isAndroidDevice =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -47,7 +62,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   @override
   void dispose() {
-    _vaultAuthApi.close();
+    _tutorial?.dispose();
     super.dispose();
   }
 
@@ -55,6 +70,99 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void initState() {
     super.initState();
     _reload();
+    if (widget.runTutorialOnStart) {
+      _setupTutorial();
+    }
+  }
+
+  void _setupTutorial() {
+    final t = VaultAppTutorial();
+    _tutorial = t;
+    void finish() => widget.onTutorialFinished?.call();
+    t.register(
+      onFinish: finish,
+      onDismiss: (_) => finish(),
+      onStart: (_, key) {
+        if (!mounted) return;
+        if (key == t.importKey) {
+          setState(() => _tabIndex = 1);
+        } else if (key == t.accountKey) {
+          setState(() => _tabIndex = 2);
+        } else if (key == t.welcomeKey ||
+            key == t.readListenKey ||
+            key == t.notesKey) {
+          setState(() => _tabIndex = 0);
+        }
+      },
+    );
+    t.start();
+  }
+
+  Widget _wrapTutorialWelcome(Widget child) {
+    final t = _tutorial;
+    if (t == null) return child;
+    return VaultAppTutorial.wrap(
+      showcaseKey: t.welcomeKey,
+      title: 'Bem-vindo ao Vault',
+      description:
+          'Este é o Início. Quando leres algo, o último volume aparece aqui '
+          'com atalhos rápidos.',
+      child: child,
+    );
+  }
+
+  Widget _wrapTutorialReadListen(Widget child) {
+    final t = _tutorial;
+    if (t == null) return child;
+    return VaultAppTutorial.wrap(
+      showcaseKey: t.readListenKey,
+      title: 'Ler e Ouvir',
+      description:
+          'Em PDFs: «Ler» abre o leitor visual; «Ouvir» activa leitura em voz '
+          'com destaque de texto e fila de reprodução. Bandas desenhadas abrem '
+          'só em modo Ler.',
+      child: child,
+    );
+  }
+
+  Widget _wrapTutorialNotes(Widget child) {
+    final t = _tutorial;
+    if (t == null) return child;
+    return VaultAppTutorial.wrap(
+      showcaseKey: t.notesKey,
+      title: 'Notas e grifos',
+      description:
+          'Dentro do leitor PDF, usa «Marcadores — notas e grifos»: notas '
+          'fixas nas páginas e grifos coloridos no texto. Guardados por livro '
+          'neste dispositivo.',
+      child: child,
+    );
+  }
+
+  Widget _wrapTutorialImport(Widget child) {
+    final t = _tutorial;
+    if (t == null) return child;
+    return VaultAppTutorial.wrap(
+      showcaseKey: t.importKey,
+      title: 'Importar ficheiros',
+      description:
+          'Toca em «Adicionar» para importar PDF, CBZ, CBR, pastas ou criar '
+          'coleções. Os ficheiros ficam na biblioteca deste dispositivo.',
+      tooltipPosition: TooltipPosition.bottom,
+      child: child,
+    );
+  }
+
+  Widget _wrapTutorialAccount(Widget child) {
+    final t = _tutorial;
+    if (t == null) return child;
+    return VaultAppTutorial.wrap(
+      showcaseKey: t.accountKey,
+      title: 'A tua conta',
+      description:
+          'Gere nome, bio e sessão. Ao sair, voltas ao ecrã de login.',
+      child: child,
+    );
   }
 
   Future<void> _reload() async {
@@ -423,14 +531,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  void _openReadModeForPdf(LibraryItem item) {
+  void _openReadModeForPdf(LibraryItem item) async {
     final idx = _getIndexForItem(item);
     if (idx < 0 || item.format != BookFormat.pdf) return;
+    final tutorialStore = VaultTutorialStore();
+    final showReaderTutorial = !await tutorialStore.isReaderTutorialCompleted();
+    if (!mounted) return;
     Navigator.push<void>(
       context,
       MaterialPageRoute(
         builder: (_) => PdfReadingModeScreen(
           item: _items[idx],
+          runTutorialOnStart: showReaderTutorial,
+          onTutorialFinished: () => tutorialStore.markReaderTutorialCompleted(),
           onPagePersist: (p, {int? totalPages}) {
             final i = _items.indexWhere((e) => e.id == item.id);
             if (i < 0) return;
@@ -595,7 +708,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _mainNavigationBar(BuildContext context) {
     final c = Theme.of(context).colorScheme;
-    return NavigationBarTheme(
+    final bar = NavigationBarTheme(
       data: NavigationBarThemeData(
         height: 76,
         indicatorColor: c.primary.withValues(alpha: 0.28),
@@ -629,7 +742,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               selectedIcon: Icon(Icons.menu_book_rounded),
             ),
             NavigationDestination(
-              tooltip: 'Conta · entrar ou registar',
+              tooltip: 'Conta · perfil',
               label: ' ',
               icon: Icon(Icons.person_outline_rounded),
               selectedIcon: Icon(Icons.person_rounded),
@@ -637,6 +750,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ],
         ),
       ),
+    );
+
+    final t = _tutorial;
+    if (t == null) return bar;
+
+    return VaultAppTutorial.wrap(
+      showcaseKey: t.navKey,
+      title: 'Navegação',
+      description:
+          'Início: continuar a ler. Biblioteca: importar e organizar. '
+          'Conta: o teu perfil Vault.',
+      tooltipPosition: TooltipPosition.top,
+      child: bar,
     );
   }
 
@@ -680,12 +806,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
         padding: EdgeInsets.fromLTRB(24, topPad + 14, 24, 18),
         child: Align(
           alignment: Alignment.centerLeft,
-          child: Text(
-            hasHero ? 'Continuar a ler' : 'Início',
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-              fontWeight: FontWeight.w800,
-              letterSpacing: -0.45,
-              color: AppTheme.ink,
+          child: _wrapTutorialWelcome(
+            Text(
+              hasHero ? 'Continuar a ler' : 'Início',
+              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                fontWeight: FontWeight.w800,
+                letterSpacing: -0.45,
+                color: AppTheme.ink,
+              ),
             ),
           ),
         ),
@@ -705,22 +833,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  DecoratedBox(
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: RadialGradient(
-                        colors: [
-                          c.primary.withValues(alpha: 0.35),
-                          c.primary.withValues(alpha: 0.08),
-                        ],
+                  _wrapTutorialReadListen(
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [
+                            c.primary.withValues(alpha: 0.35),
+                            c.primary.withValues(alpha: 0.08),
+                          ],
+                        ),
                       ),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.all(28),
-                      child: Icon(
-                        Icons.auto_stories_rounded,
-                        size: 56,
-                        color: c.primary.withValues(alpha: 0.95),
+                      child: Padding(
+                        padding: const EdgeInsets.all(28),
+                        child: Icon(
+                          Icons.auto_stories_rounded,
+                          size: 56,
+                          color: c.primary.withValues(alpha: 0.95),
+                        ),
                       ),
                     ),
                   ),
@@ -735,15 +865,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     ),
                   ),
                   const SizedBox(height: 12),
-                  Text(
-                    'Na barra inferior, abre Biblioteca (2.º ícone) e importa um PDF '
-                    'ou banda desenhada. Depois de leres pelo menos uma vez, '
-                    'o último volume aparece aqui em grande, com Ler e Ouvir.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: AppTheme.muted,
-                      height: 1.5,
-                      fontSize: 15,
+                  _wrapTutorialNotes(
+                    Text(
+                      'Na barra inferior, abre Biblioteca (2.º ícone) e importa um PDF '
+                      'ou banda desenhada. Depois de leres pelo menos uma vez, '
+                      'o último volume aparece aqui em grande, com Ler e Ouvir.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: AppTheme.muted,
+                        height: 1.5,
+                        fontSize: 15,
+                      ),
                     ),
                   ),
                 ],
@@ -1154,39 +1286,41 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         ),
                       ),
                     ],
-                child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 10,
-                    ),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(24),
-                      color: c.primary,
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.28),
-                          blurRadius: 10,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(Icons.add_rounded, color: c.onPrimary),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Adicionar',
-                          style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                                color: c.onPrimary,
-                                fontWeight: FontWeight.w700,
-                              ),
-                        ),
-                        const SizedBox(width: 6),
-                        Icon(Icons.expand_more_rounded, color: c.onPrimary),
-                      ],
+                child: _wrapTutorialImport(
+                  Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(24),
+                        color: c.primary,
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.28),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.add_rounded, color: c.onPrimary),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Adicionar',
+                            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                  color: c.onPrimary,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                          ),
+                          const SizedBox(width: 6),
+                          Icon(Icons.expand_more_rounded, color: c.onPrimary),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -1310,7 +1444,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
           children: [
             _buildRecentHome(c, sagas),
             _buildLibraryTab(c, sagas),
-            AccountScreen(authApi: _vaultAuthApi, authStore: _vaultAuthStore),
+            _wrapTutorialAccount(
+              AccountScreen(
+                authApi: widget.authApi,
+                authStore: widget.authStore,
+                libraryItems: _items,
+                embeddedInLibrary: true,
+                onSessionEnded: widget.onSessionEnded,
+              ),
+            ),
           ],
         ),
       ),

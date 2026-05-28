@@ -5,20 +5,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 class VaultUser {
   const VaultUser({
     required this.id,
-    required this.email,
+    required this.apelido,
     required this.displayName,
     required this.bio,
   });
 
   final String id;
-  final String email;
+  final String apelido;
   final String displayName;
   final String bio;
 
   factory VaultUser.fromJson(Map<String, dynamic> json) {
     return VaultUser(
       id: json['id'] as String? ?? '',
-      email: json['email'] as String? ?? '',
+      apelido: json['apelido'] as String? ?? '',
       displayName: json['display_name'] as String? ?? '',
       bio: json['bio'] as String? ?? '',
     );
@@ -26,7 +26,7 @@ class VaultUser {
 
   Map<String, dynamic> toJson() => {
         'id': id,
-        'email': email,
+        'apelido': apelido,
         'display_name': displayName,
         'bio': bio,
       };

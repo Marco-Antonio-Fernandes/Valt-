@@ -8,10 +8,14 @@ class StartupLoadingScreen extends StatelessWidget {
     super.key,
     this.errorMessage,
     this.onRetry,
+    this.statusMessage,
   });
 
   final String? errorMessage;
   final VoidCallback? onRetry;
+
+  /// Texto secundário sob o indicador (ex.: «A verificar sessão…»).
+  final String? statusMessage;
 
   @override
   Widget build(BuildContext context) {
@@ -75,7 +79,7 @@ class StartupLoadingScreen extends StatelessWidget {
                     ),
                     const SizedBox(height: 16),
                     Text(
-                      'A preparar o leitor PDF',
+                      statusMessage ?? 'A preparar o leitor PDF',
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                             color: cs.onSurfaceVariant.withValues(alpha: 0.85),

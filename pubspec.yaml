@@ -53,6 +53,7 @@ dependencies:
   permission_handler: ^12.0.1
   wakelock_plus: ^1.5.2
   flutter_local_notifications: ^21.0.0
+  showcaseview: ^5.0.2
 dev_dependencies:
   flutter_test:
     sdk: flutter
